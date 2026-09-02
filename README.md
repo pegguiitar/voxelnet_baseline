@@ -50,46 +50,64 @@ real steps before committing to a full run (see "Measuring before training" belo
 
 ## BEV backbone experiments (`model/experiments/`)
 
-A second comparison series, alongside the fully-sparse-head experiment above: three
-sparse backbone STRUCTURES, each wrapped so the backbone itself outputs a dense BEV
-feature map directly (scatter-to-dense + z-into-channels merge happens inside the
-backbone via `sparse_ops.scatter_to_bev`, not in the caller), then fed to
-`RPNCenterHead` (the original dense pipeline's head, unchanged) instead of the
-sparse-per-voxel `SparseCenterHead`. Each experiment is self-contained
-(`voxelnet.py`/`train.py`/`smoke_test.py`) but shares `config.py`, `sparse_ops.py`,
-`model.py`, `sparse_bev_head.py` from `model/` (the parent directory).
+A second comparison series, alongside the fully-sparse-head experiment above. All
+three replace `SparseCenterHead` with `RPNCenterHead` (the original dense pipeline's
+head, unchanged) fed by a dense BEV feature map -- but they answer two DIFFERENT
+questions, so read the backbone column below rather than assuming all 3 are directly
+comparable to each other:
 
-All 3 use the same `SPARSE_BEV_*` voxelization settings (`VOXEL_SIZE=(0.1,0.1,0.5)`,
-same point cloud range/grid as the dense baseline's x,y) and the same BEV-collapse
-method (plain scatter+reshape, no learned z-conv) so the comparison isolates backbone
-STRUCTURE alone:
+- **exp1/exp2 ("which sparse backbone structure is best?")**: each wraps a whole
+  sparse 3D backbone (single-stage vs. 4-stage down/SlotFormer/up) so the backbone
+  itself scatters to dense + merges z into channels at the end
+  (`sparse_ops.scatter_to_bev`) and returns a ready BEV feature map. Same
+  `SPARSE_BEV_*` voxelization and the same collapse method across both, so the
+  comparison isolates backbone STRUCTURE alone.
+- **exp3 ("what if ONLY the dense pipeline's z-collapse step were sparse?")**: not a
+  backbone-structure swap at all -- `model.ConvMiddleLayers` (dense pipeline's own
+  3-layer z-collapse) is reproduced layer-for-layer (same channels, same per-layer
+  kernel/stride/padding) using `SparseConv3dDown` instead of `nn.Conv3d`. VFE and
+  `RPNCenterHead`/`RPNBackbone` are the exact same dense-pipeline code, and there's no
+  SlotFormer or extra backbone stages -- this isolates the effect of sparsity in that
+  one component alone, as close to an apples-to-apples dense-vs-sparse ablation as
+  this codebase gets.
 
-| experiment | backbone | SlotFormer | x,y downsampled by backbone? |
-|---|---|---|---|
-| `exp1_single_stage_bev` | `backbone3d.Sparse3DBackbone`, 1 stage (`SPARSE_BACKBONE_*`) | external, 2 cycles (6L) | yes (isotropic stride) |
-| `exp2_down_slot_up_bev` | `backbone3d_down_slot_up.SparseDownSlotUpBackbone`, 4-stage down + 4-stage full restore (`SPARSE_BEV_*`) | built into the backbone, at the bottleneck | yes (isotropic stride), but decoder restores back to input resolution |
-| `exp3_zdown_bev` | z-ONLY-stride sparse conv (`SPARSE_BEV_ZDOWN_*`), mirrors the original VoxelNet's `ConvMiddleLayers` philosophy | external, 2 cycles (6L), win_size=48 (x,y never shrink) | **no** -- only z shrinks |
+Each experiment is self-contained (`voxelnet.py`/`train.py`/`smoke_test.py`, one
+`<Name>BEVBackbone` class + one `SparseBEV<Name>VoxelNet` class per file) but shares
+`config.py`, `sparse_ops.py`, `model.py`, `sparse_bev_head.py` from `model/` (the
+parent directory):
+
+| folder | backbone class | VoxelNet class | SlotFormer | x,y downsampled by backbone? |
+|---|---|---|---|---|
+| `exp1_single_stage_bev` | `SingleStageBEVBackbone` (wraps `backbone3d.Sparse3DBackbone`, 1 stage, `SPARSE_BACKBONE_*`) | `SparseBEVSingleStageVoxelNet` | external, 2 cycles (6L) | yes (isotropic stride) |
+| `exp2_down_slot_up_bev` | `DownSlotUpBEVBackbone` (wraps `backbone3d_down_slot_up.SparseDownSlotUpBackbone`, 4-stage down + 4-stage full restore, `SPARSE_BEV_*`) | `SparseBEVDownSlotUpVoxelNet` | built into the backbone, at the bottleneck | yes (isotropic stride), but decoder restores back to input resolution |
+| `exp3_conv_middle_bev` | `ConvMiddleBEVBackbone` (sparse mirror of `model.ConvMiddleLayers`, `SPARSE_BEV_CONVMID_CHANNELS`) | `SparseBEVConvMiddleVoxelNet` | none (dense baseline has none either) | **no** -- x,y's SIZE is unchanged (stride=1, "same" padding, exactly like the dense layer it mirrors); only D shrinks |
 
 Run from inside each experiment's own folder (each inserts `model/`'s path via
 `sys.path` so `import config`/`from model import ...`/etc. resolve to the shared
 parent modules):
 
 ```bash
-cd model/experiments/exp1_single_stage_bev   # or exp2_down_slot_up_bev / exp3_zdown_bev
+cd model/experiments/exp1_single_stage_bev   # or exp2_down_slot_up_bev / exp3_conv_middle_bev
 python smoke_test.py                          # structural check, synthetic data, no dataset needed
 python train.py --ckpt_dir checkpoints_exp1_single_stage_bev --batch_size <N> --epochs 20
 ```
 
-**Not yet measured on real GPU hardware for exp1/exp2** at the time this was written
--- only verified structurally via each `smoke_test.py`. `exp3_zdown_bev` surfaced (and
-`sparse_ops.py`'s `SparseConv3dDown` now fixes) a real bug: a stride==1 axis (x,y
-here) used to loop over the full kernel window when generating output candidate
-coordinates, "dilating" the active voxel set outward every stage even though nothing
-was being downsampled there -- compounding across 4 stages this caused a CUDA OOM
-from just 800 synthetic input voxels. Fixed by restricting stride==1 axes to a single
-center-tap candidate (true submanifold behavior there, matching `SubMConv3d`), which
-does not affect the other two experiments (both use isotropic stride, no stride==1
-axis exists for them).
+**Not yet measured on real GPU hardware** at the time this was written -- only
+verified structurally via each `smoke_test.py`. Building exp3 surfaced (and
+`sparse_ops.py`'s `SparseConv3dDown` now fixes) a real correctness bug that also
+mattered for the z-only-stride design exp3 replaced: a stride==1 axis used to loop
+over the full kernel window when generating output candidate coordinates. For a
+"same"-padding stride==1 axis (padding==kernel//2, e.g. x,y throughout exp1's
+predecessor) this "dilates" the active voxel set outward every stage even though
+nothing is being downsampled there -- compounding across stages this caused a CUDA
+OOM from just 800 synthetic voxels. Fixed by restricting such axes to a single
+center-tap candidate (true submanifold behavior, matching `SubMConv3d`) -- but ONLY
+when padding==kernel//2: exp3's own middle layer is stride==1 on every axis with
+padding=0 on z specifically (a genuinely shrinking "valid" conv, not a
+resolution-preserving one), which correctly falls back to the full kernel search
+instead, or the center-tap trick would silently produce the wrong output domain.
+Neither case affects exp1/exp2 (both use isotropic stride, no stride==1 axis exists
+for them).
 
 ## Setup
 

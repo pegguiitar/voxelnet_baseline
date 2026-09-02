@@ -174,26 +174,16 @@ SPARSE_BEV_SLOTFORMER_WIN_SIZE = 3    # x,y voxel size (0.1) and backbone depth/
 SPARSE_BEV_SLOTFORMER_NUM_CYCLES = 2  # 6L, matching the current experiment this is based on
 SPARSE_BEV_SLOTFORMER_NUM_HEADS = 4
 
-# experiments/exp3_zdown_bev/voxelnet.py 전용 (2026-09-02) -- x,y는 전혀 안 건드리고 z만 sparse
-# conv로 stride 줘서 줄인 뒤(SparseConv3dDown(stride=(2,1,1)), coords가 [batch,z,y,x] 순서라
-# stride의 첫 값이 z), 그 결과를 dense (B,C,D,H,W)로 scatter+reshape해서 BEV를 만든다.
-# 원조 VoxelNet의 ConvMiddleLayers(z만 3번 다운샘플, x,y는 그대로 두고 2D RPN에 맡김)와
-# 정확히 같은 설계 철학을 sparse 버전으로 구현한 것 -- exp1_single_stage_bev/exp2_down_slot_up_bev는
-# 둘 다 x,y까지 같이 다운샘플하는 등방 backbone을 쓴 뒤 BEV로 누르는 거라 이거와 다르다(x,y
-# 해상도가 backbone 단계에서 전혀 안 줄어드는 게 이 실험만의 특징).
-# STAGE_CHANNELS 4단계, 매 단계 stride=(2,1,1) 대칭 padding=1 -- D: 22->11->6->3->2.
-SPARSE_BEV_ZDOWN_STAGE_CHANNELS = (64, 96, 128, 128)
-SPARSE_BEV_ZDOWN_NUM_BLOCKS_PER_STAGE = 1  # 가볍게 -- x,y가 안 줄어서 매 단계 voxel 수가
-                                            # 등방 backbone보다 훨씬 많이 남아있음(z만 줄어듦)
-SPARSE_BEV_ZDOWN_DOWNSAMPLE_KERNEL = 3
-# SlotFormer는 이 backbone의 최종(z만 줄어든) 출력에서 돌린다 -- x,y가 한 번도 안 줄어서
-# 유효 해상도가 원래 VOXEL_SIZE(0.1)m/voxel 그대로다. 물리적 윈도우 ~4.8m 기준
-# WIN_SIZE=4.8/0.1=48. 다만 x,y가 fine한 채로 남아있어 active voxel 수가 등방 backbone
-# 버전들보다 훨씬 많을 수 있음 -- 실측 전엔 비용을 장담 못 함(이게 이 실험의 핵심 질문).
-SPARSE_BEV_ZDOWN_SLOTFORMER_ENABLED = True
-SPARSE_BEV_ZDOWN_SLOTFORMER_WIN_SIZE = 48
-SPARSE_BEV_ZDOWN_SLOTFORMER_NUM_CYCLES = 2  # 6L ("2cycle")
-SPARSE_BEV_ZDOWN_SLOTFORMER_NUM_HEADS = 4
+# experiments/exp3_conv_middle_bev/voxelnet.py 전용 (2026-09-02) -- exp1/exp2와 달리 backbone
+# 구조 자체를 바꾸는 실험이 아니라, dense pipeline(model.py)에서 딱 ConvMiddleLayers 한
+# 부분만 sparse conv로 바꾸면 어떻게 되는지 보는 실험. VFE/RPNBackbone/RPNCenterHead는
+# dense와 완전히 동일(코드 재사용), SlotFormer도 없음 -- ConvMiddleLayers와 똑같은 3-layer
+# 모양(channels 128->64->64->64, kernel=3, stride/padding (2,1,1)/(1,1,1) -> (1,1,1)/(0,1,1)
+# -> (2,1,1)/(1,1,1))을 SparseConv3dDown으로 그대로 복제한다 -- 채널 폭도 dense와 동일하게
+# 64로 고정(별도 STAGE_CHANNELS 없음, 원본 ConvMiddleLayers처럼 하드코딩된 모양).
+# (이전엔 여기 exp3가 z만 계속 줄이는 4단계 커스텀 backbone+SlotFormer였으나, "dense에서
+# BEV로 누르는 부분만 sparse로 바꾼 것"을 보고 싶다는 요청으로 이 설계로 교체됨.)
+SPARSE_BEV_CONVMID_CHANNELS = 64  # ConvMiddleLayers의 고정 채널 폭과 동일
 
 # --- 학습 ---
 BATCH_SIZE = 4

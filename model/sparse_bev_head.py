@@ -3,7 +3,7 @@
 has a DIFFERENT resolution/range than the dense pipeline's hardcoded
 config.ANCHOR_GRID_SIZE/config.ANCHOR_STRIDE/config.POINT_CLOUD_RANGE (those describe
 the ORIGINAL VoxelNet car-config grid, not these experiments' SPARSE_BEV_* one).
-Shared by all 3 experiments (exp1_single_stage_bev/exp2_down_slot_up_bev/exp3_zdown_bev).
+Shared by all 3 experiments (exp1_single_stage_bev/exp2_down_slot_up_bev/exp3_conv_middle_bev).
 
 gt_boxes input format matches sparse_center_head.build_sparse_targets exactly --
 (M,13) [x,y,z,l,w,h,theta_z(unused),6D-rot(6)], cache_dataset.py's layout, the same

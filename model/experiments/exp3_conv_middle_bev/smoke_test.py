@@ -1,5 +1,5 @@
-"""smoke_test.py (exp3_zdown_bev) - synthetic-data structural test for
-SparseBEVZDownVoxelNet (model construction -> forward -> BEV target building
+"""smoke_test.py (exp3_conv_middle_bev) - synthetic-data structural test for
+SparseBEVConvMiddleVoxelNet (model construction -> forward -> BEV target building
 -> dense center_voxelnet_loss -> backward -> decode).
 
 Usage: python smoke_test.py
@@ -18,7 +18,7 @@ from center_loss import center_voxelnet_loss
 from sparse_bev_head import build_bev_targets, decode_bev_center_boxes
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from voxelnet import SparseBEVZDownVoxelNet  # noqa: E402
+from voxelnet import SparseBEVConvMiddleVoxelNet  # noqa: E402
 
 
 def make_synthetic_batch(batch_size=2, n_voxels_per_sample=400, n_gt_per_sample=2, device="cpu"):
@@ -63,7 +63,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    model = SparseBEVZDownVoxelNet().to(device)
+    model = SparseBEVConvMiddleVoxelNet().to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"params: {n_params:,}  input_grid_size(D,H,W): {model.input_grid_size}  "
           f"out_grid_size(D,H,W): {model.out_grid_size}  head_grid_size(W'',H''): {model.head_grid_size}  "
@@ -113,7 +113,7 @@ def main():
         )
         print(f"  sample {b}: {len(boxes)} decoded boxes (score_thresh=0.0, pre-training so meaningless numerically)")
 
-    print("\nOK -- exp3_zdown_bev forward/target/loss/backward/decode all ran without error.")
+    print("\nOK -- exp3_conv_middle_bev forward/target/loss/backward/decode all ran without error.")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""train.py (exp3_zdown_bev) - trains SparseBEVZDownVoxelNet.
+"""train.py (exp3_conv_middle_bev) - trains SparseBEVConvMiddleVoxelNet.
 
 Uses the scene-level 3-way split (TRAIN_SCENES/VAL_SCENES/TEST_SCENES,
 sonar_diver_dataset.py) -- val is held out at the scene level, same as test.
@@ -11,8 +11,8 @@ isn't supervised; add a "points" field to __getitem__/collate_fn if this aux los
 turns out to matter.
 
 Usage:
-    python train.py --ckpt_dir checkpoints_exp3_zdown_bev
-    python train.py --ckpt_dir checkpoints_exp3_zdown_bev --resume checkpoints_exp3_zdown_bev/last.pth
+    python train.py --ckpt_dir checkpoints_exp3_conv_middle_bev
+    python train.py --ckpt_dir checkpoints_exp3_conv_middle_bev --resume checkpoints_exp3_conv_middle_bev/last.pth
 """
 import argparse
 import csv
@@ -33,7 +33,7 @@ from sparse_bev_head import build_bev_targets, decode_bev_center_boxes
 from center_loss import center_voxelnet_loss
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from voxelnet import SparseBEVZDownVoxelNet  # noqa: E402
+from voxelnet import SparseBEVConvMiddleVoxelNet  # noqa: E402
 
 LOSS_KEYS = ["hm_loss", "reg_loss", "offset_loss", "z_loss", "dim_loss", "rot_loss", "density_loss"]
 
@@ -120,7 +120,7 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, step, epoch_comple
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt_dir", default="checkpoints_exp3_zdown_bev")
+    parser.add_argument("--ckpt_dir", default="checkpoints_exp3_conv_middle_bev")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS)
     parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
@@ -142,7 +142,7 @@ def main():
     val_loader = build_dataloader("val", args.batch_size, shuffle=False, num_workers=args.num_workers)
     print(f"train batches/epoch: {len(train_loader)}  val batches: {len(val_loader)}")
 
-    model = SparseBEVZDownVoxelNet().to(device)
+    model = SparseBEVConvMiddleVoxelNet().to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"params: {n_params:,}  out_grid_size(D,H,W): {model.out_grid_size}  "
           f"head_grid_size(W'',H''): {model.head_grid_size}  head_stride: {model.head_stride}")

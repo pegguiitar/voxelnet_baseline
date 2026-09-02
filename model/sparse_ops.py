@@ -215,25 +215,36 @@ class SparseConv3dDown(nn.Module):
         if coords.shape[0] == 0:
             out_coords = torch.zeros((0, 4), dtype=torch.long, device=device)
         else:
-            # For an axis with stride==1 (e.g. x,y in a z-only downsample), every
-            # kernel offset maps to a DIFFERENT output coordinate (out = in - koff +
-            # padding), so looping over the full k offsets there -- as the isotropic
-            # case correctly does when every axis is actually being strided -- would
-            # instead "dilate" the active set outward by up to k//2 voxels on that
-            # axis EVERY stage, even though nothing is being downsampled there. Left
-            # unchecked this compounds across stages (measured: 800 synthetic input
-            # voxels -> CUDA OOM by the 4th stage). Using only the center tap
-            # (koff=padding, giving out=in exactly) for stride==1 axes keeps output
-            # support on that axis IDENTICAL to input support -- true submanifold
-            # behavior on the non-strided axes, matching SubMConv3d -- while the
-            # actual gather in _sparse_conv_core still uses the full k^3 kernel
-            # window regardless of how out_coords was built, so the conv's
-            # receptive field in x,y is unaffected; only which positions get
+            # For an axis with stride==1 AND "same"-style padding (padding==k//2,
+            # e.g. x,y in a z-only downsample), every kernel offset maps to a
+            # DIFFERENT output coordinate (out = in - koff + padding), so looping
+            # over the full k offsets there -- as the isotropic case correctly does
+            # when every axis is actually being strided -- would instead "dilate"
+            # the active set outward by up to k//2 voxels on that axis EVERY stage,
+            # even though nothing is being downsampled there. Left unchecked this
+            # compounds across stages (measured: 800 synthetic input voxels -> CUDA
+            # OOM by the 4th stage). Using only the center tap (koff=padding, giving
+            # out=in exactly) for such axes keeps output support on that axis
+            # IDENTICAL to input support -- true submanifold behavior, matching
+            # SubMConv3d -- while the actual gather in _sparse_conv_core still uses
+            # the full k^3 kernel window regardless of how out_coords was built, so
+            # the conv's receptive field is unaffected; only which positions get
             # computed changes. No-op for the isotropic (all-axes-strided) case.
+            #
+            # Requiring padding==k//2 (not just stride==1) matters: a "valid"-style
+            # stride==1 layer (padding=0, e.g. model.ConvMiddleLayers' middle conv,
+            # kernel=3/stride=1/padding=0 on z to shrink D by 2 without striding)
+            # is genuinely a shrinking conv, not a resolution-preserving one -- the
+            # center-tap trick would wrongly claim out=in (same support/size as
+            # input) instead of discovering the true, smaller valid-conv output
+            # domain, silently corrupting results instead of erroring. Falling back
+            # to the full k-offset search there is correct AND still bounded (the
+            # output domain this produces is inherently smaller than the input's,
+            # so it can't runaway-dilate the way a same-padding stride==1 axis would).
             ar = torch.arange(k, device=device)
-            off0 = ar if s0 != 1 else torch.tensor([p0], device=device)
-            off1 = ar if s1 != 1 else torch.tensor([p1], device=device)
-            off2 = ar if s2 != 1 else torch.tensor([p2], device=device)
+            off0 = ar if not (s0 == 1 and p0 == k // 2) else torch.tensor([p0], device=device)
+            off1 = ar if not (s1 == 1 and p1 == k // 2) else torch.tensor([p1], device=device)
+            off2 = ar if not (s2 == 1 and p2 == k // 2) else torch.tensor([p2], device=device)
             offsets = torch.stack(torch.meshgrid(off0, off1, off2, indexing="ij"), dim=-1).reshape(-1, 3)  # (K,3)
 
             numer_0 = coords[None, :, 1] - offsets[:, 0:1] + p0  # (K,N)
