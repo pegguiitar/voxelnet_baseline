@@ -16,9 +16,16 @@ backbone3d.Sparse3DBackbone + external SlotFormer the earlier 6L experiment used
 SlotFormer now lives INSIDE the backbone, so there's no separate slot_backbone here.
 
 Coordinate convention: coords stay in voxelize.py's native (N,4) [batch,z_idx,y_idx,x_idx]
-order end to end -- sparse_ops.py's ops are axis-order-agnostic (they just need
-grid_size passed in the same column order as coords), so no permutation is needed as
-long as every grid_size here is (D,H,W) to match.
+order end to end -- backbone3d_down_slot_up.py's ops are axis-order-agnostic (they
+just need grid_size passed in the same column order as coords), so no permutation is
+needed as long as every grid_size here is (D,H,W) to match.
+
+2026-09-03: backbone3d_down_slot_up.SparseDownSlotUpBackbone migrated to spconv --
+see that module's docstring and experiments/exp3_conv_middle_bev/voxelnet.py's for
+why (the from-scratch sparse_ops.py backward pass was the real bottleneck, ~80% of
+total step time, not backbone depth/SlotFormer). Its (features, coords, grid_size)
+tuple interface is unchanged, just no more index_grid argument (spconv manages its
+own internal indices, so build_index_grid is gone too).
 """
 
 import torch
@@ -27,7 +34,6 @@ import torch.nn as nn
 import config
 from model import StackedVFE
 from backbone3d_down_slot_up import SparseDownSlotUpBackbone
-from sparse_ops import build_index_grid
 from sparse_center_head import SparseCenterHead
 
 
@@ -67,10 +73,9 @@ class SparseVoxelNet(nn.Module):
         which must operate on the SAME active set the predictions came from)."""
         voxelwise = self.vfe(voxel_features, num_points)  # (K_total,128)
         batch_size = int(coords[:, 0].max().item()) + 1 if len(coords) else 1
-        index_grid = build_index_grid(coords, batch_size, self.input_grid_size, device=voxelwise.device)
 
-        bb_feat, bb_coords, _, bb_grid_size = self.backbone(
-            voxelwise, coords, index_grid, self.input_grid_size, batch_size
+        bb_feat, bb_coords, bb_grid_size = self.backbone(
+            voxelwise, coords, self.input_grid_size, batch_size
         )
         pred = self.head(bb_feat)
         return pred, bb_coords, bb_grid_size

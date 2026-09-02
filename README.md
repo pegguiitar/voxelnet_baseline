@@ -92,22 +92,35 @@ python smoke_test.py                          # structural check, synthetic data
 python train.py --ckpt_dir checkpoints_exp1_single_stage_bev --batch_size <N> --epochs 20
 ```
 
-**Not yet measured on real GPU hardware** at the time this was written -- only
-verified structurally via each `smoke_test.py`. Building exp3 surfaced (and
-`sparse_ops.py`'s `SparseConv3dDown` now fixes) a real correctness bug that also
-mattered for the z-only-stride design exp3 replaced: a stride==1 axis used to loop
-over the full kernel window when generating output candidate coordinates. For a
-"same"-padding stride==1 axis (padding==kernel//2, e.g. x,y throughout exp1's
-predecessor) this "dilates" the active voxel set outward every stage even though
-nothing is being downsampled there -- compounding across stages this caused a CUDA
-OOM from just 800 synthetic voxels. Fixed by restricting such axes to a single
-center-tap candidate (true submanifold behavior, matching `SubMConv3d`) -- but ONLY
-when padding==kernel//2: exp3's own middle layer is stride==1 on every axis with
-padding=0 on z specifically (a genuinely shrinking "valid" conv, not a
-resolution-preserving one), which correctly falls back to the full kernel search
-instead, or the center-tap trick would silently produce the wrong output domain.
-Neither case affects exp1/exp2 (both use isotropic stride, no stride==1 axis exists
-for them).
+### Backend: spconv, not this repo's own sparse_ops.py
+
+All 3 backbones above are now built on **spconv** (traveller59/spconv2, package
+`spconv-cu126`) instead of this repo's own from-scratch sparse conv primitives
+(`sparse_ops.py`'s `SparseConv3dDown`/`SubMConv3d`/`SparseInverseConv3d`).
+`sparse_ops.py` was originally written to avoid a compiled-CUDA-extension
+dependency (a common source of broken Colab setups -- see that file's own
+docstring) -- but `experiments/profile_pipeline.py` (per-submodule forward/backward
+timing via hooks) found its hand-rolled backward pass ate **~80% of total step
+time** in exp3, ~23x its own forward cost (a normal dense conv's backward is
+roughly 2x its forward), and that cost didn't shrink even when the surrounding
+backbone had almost no other compute (exp3 is just 3 conv layers). Switching to
+spconv's real CUDA kernels fixed this directly, since it happened to already be
+installed and working in this venv:
+
+| experiment | before (sparse_ops.py) | after (spconv) | speedup |
+|---|---|---|---|
+| exp3_conv_middle_bev | ~1.4 it/s, 4.3GB | ~6.2-6.3 it/s, 3.4GB | ~4.4x |
+| exp1_single_stage_bev | (not measured pre-spconv) | ~3.2-3.5 it/s, ~7-8GB | -- |
+| exp2_down_slot_up_bev | (not measured pre-spconv) | ~2.5 it/s, ~7GB | -- |
+| dense_baseline_bev (real `nn.Conv3d`, for comparison) | -- | ~0.74 it/s, 7.9GB | exp3 now ~8.4x faster than dense |
+
+(batch_size=4, RTX 2070 8GB, real sonar data -- all measured over 250+ real
+training steps per this repo's "measure before committing" methodology, not
+synthetic-data smoke tests.) `sparse_ops.py`'s `build_index_grid` and
+`scatter_to_bev` are still used (the scatter step was never the bottleneck --
+its backward is a plain gather over unique indices, not the duplicate-index
+scatter-add pattern that was actually slow) but the from-scratch conv primitives
+are dead code now that backbone3d.py/backbone3d_down_slot_up.py both use spconv.
 
 ## Setup
 
@@ -116,8 +129,12 @@ cd model
 python -m venv .venv
 .venv\Scripts\activate      # Windows
 pip install torch --index-url https://download.pytorch.org/whl/cu126   # match your driver's CUDA
-# (no separate requirements.txt yet on this branch -- torch/tqdm/pyyaml/numpy cover it)
+pip install spconv-cu126   # match your CUDA version instead if not cu126 -- see spconv's PyPI page for the list
+# (no separate requirements.txt yet on this branch -- torch/spconv/tqdm/pyyaml/numpy cover it)
 ```
+
+`sparse_voxelnet.py` and every `experiments/*_bev/voxelnet.py` need spconv (see
+"Backend: spconv" above); the fully-dense `main` branch pipeline doesn't.
 
 Dataset: `sonar_diver_dataset.py` reads directly from the sibling
 `labeling-tool-main/dataset` (i.e. this repo and `labeling-tool-main` need to be

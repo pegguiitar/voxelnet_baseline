@@ -1,31 +1,29 @@
-"""exp3_conv_middle_bev - Direct sparse-conv mirror of model.ConvMiddleLayers, the
-ONLY part of the dense pipeline changed here. VFE and RPNBackbone/RPNCenterHead are
-the exact same code the dense baseline uses; there's no SlotFormer and no extra
-backbone stages, unlike exp1/exp2 in this experiments/ folder (which change the
-whole 3D backbone's structure). This isolates the effect of doing JUST the z-collapse
-step sparsely instead of also changing backbone depth/adding attention.
+"""exp3_conv_middle_bev - Direct sparse-conv mirror of model.ConvMiddleLayers, now
+built on spconv (traveller59/spconv2, installed as spconv-cu126==2.3.8 in this venv)
+instead of this repo's own from-scratch sparse_ops.py primitives.
 
-model.ConvMiddleLayers is 3 dense Conv3d layers (channels 128->64->64->64, kernel=3,
-stride/padding (2,1,1)/(1,1,1) -> (1,1,1)/(0,1,1) -> (2,1,1)/(1,1,1)) that shrink D
-while leaving H,W's SIZE unchanged (stride=1, "same" padding=1 there in layers 1/3;
-layer 2 is stride=1 in every axis but padding=0 on D specifically, a "valid" conv
-that shrinks D by 2 without striding -- x,y still "same" there too). ConvMiddleBEVBackbone
-below reuses SparseConv3dDown with the identical (kernel, stride, padding) triples for
-all 3 layers -- the only change is which primitive computes each layer's output.
+2026-09-03: profiling (experiments/profile_pipeline.py) found the from-scratch
+SparseConv3dDown's BACKWARD pass -- not forward, not the shared 2D head -- ate 80%
+of total step time here, ~23x its own forward cost (a typical dense conv's backward
+is roughly 2x its forward). That's specific to how sparse_ops.py computes gradients
+through its hand-rolled gather+einsum+advanced-indexing implementation (plain
+autograd deriving through those ops, no purpose-built backward kernel) -- not
+something fixable by changing backbone depth or adding/removing SlotFormer, since
+even this experiment's minimal 3-layer backbone showed the same bottleneck. spconv
+ships real CUDA kernels with a proper backward for both submanifold (SubMConv3d) and
+regular/strided (SparseConv3d) sparse convolution -- exactly the two conv types
+sparse_ops.py was hand-rolling as SubMConv3d/SparseConv3dDown.
 
-2026-09-02: verifying this exposed a real correctness gap in SparseConv3dDown's
-stride==1 handling (fixed in sparse_ops.py, shared by all 3 experiments): the
-exp3_zdown_bev design this replaces needed stride==1 axes to behave as true
-submanifold (output support IDENTICAL to input, since x,y were meant to never
-shrink or grow) -- but this experiment's own middle layer is ALSO stride==1 on
-every axis, with padding=0 on D specifically, which is a genuinely SHRINKING
-("valid") conv, not a resolution-preserving one. Naively treating every stride==1
-axis as submanifold (as the first fix did) would have wrongly forced out=in there
-instead of discovering the true, smaller valid-conv output domain -- silently wrong
-results, not an error. Fixed by only applying the submanifold restriction when
-padding == kernel_size // 2 ("same" mode) -- true for x,y in every layer here and
-for D in layers 1/3, false for D in layer 2, which correctly falls back to the full
-kernel-offset search there.
+This also simplifies the code: spconv's SparseConvTensor manages its own internal
+index/rulebook bookkeeping, so build_index_grid and the manual candidate-coordinate
+search sparse_ops.py needed are gone entirely -- SparseConvTensor.dense() directly
+replaces sparse_ops.scatter_to_bev's scatter step too (still followed by the same
+z-into-channels reshape).
+
+Still the exact same 3-layer shape as model.ConvMiddleLayers (channels
+128->64->64->64, kernel=3, stride/padding (2,1,1)/(1,1,1) -> (1,1,1)/(0,1,1) ->
+(2,1,1)/(1,1,1)), verified to produce the identical output spatial shape as before
+(D: 22->11->9->5 for this experiment's grid) -- only the compute backend changed.
 """
 import sys
 from pathlib import Path
@@ -34,47 +32,56 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # -> vox
 
 import torch
 import torch.nn as nn
+import spconv.pytorch as spconv
 
 import config
 from model import StackedVFE, RPNCenterHead
-from sparse_ops import build_index_grid, SparseConv3dDown, scatter_to_bev
 
 
 class ConvMiddleBEVBackbone(nn.Module):
-    """Sparse mirror of model.ConvMiddleLayers -- same 3-layer shape, same channel
-    widths, same per-layer (kernel, stride, padding), computed with SparseConv3dDown
-    instead of nn.Conv3d. Outputs a dense BEV feature map directly (scatter-to-dense
-    + z-into-channels merge happens here, same as exp1/exp2's backbones)."""
+    """spconv mirror of model.ConvMiddleLayers -- same 3-layer shape, same channel
+    widths, same per-layer (kernel, stride, padding), computed with spconv.SparseConv3d
+    instead of nn.Conv3d (dense) or the hand-rolled SparseConv3dDown (slow backward,
+    see module docstring). Outputs a dense BEV feature map directly."""
 
     def __init__(self, in_channels=128, mid_channels=64):
         super().__init__()
-        self.conv1 = SparseConv3dDown(in_channels, mid_channels, kernel_size=3, stride=(2, 1, 1), padding=(1, 1, 1))
+        self.conv1 = spconv.SparseConv3d(in_channels, mid_channels, kernel_size=3,
+                                          stride=(2, 1, 1), padding=(1, 1, 1), bias=True)
         self.bn1 = nn.BatchNorm1d(mid_channels)
-        self.conv2 = SparseConv3dDown(mid_channels, mid_channels, kernel_size=3, stride=(1, 1, 1), padding=(0, 1, 1))
+        self.conv2 = spconv.SparseConv3d(mid_channels, mid_channels, kernel_size=3,
+                                          stride=(1, 1, 1), padding=(0, 1, 1), bias=True)
         self.bn2 = nn.BatchNorm1d(mid_channels)
-        self.conv3 = SparseConv3dDown(mid_channels, mid_channels, kernel_size=3, stride=(2, 1, 1), padding=(1, 1, 1))
+        self.conv3 = spconv.SparseConv3d(mid_channels, mid_channels, kernel_size=3,
+                                          stride=(2, 1, 1), padding=(1, 1, 1), bias=True)
         self.bn3 = nn.BatchNorm1d(mid_channels)
         self.relu = nn.ReLU(inplace=True)
         self.out_channels = mid_channels
 
     @staticmethod
     def output_grid_size(grid_size):
-        """Same arithmetic as model.ConvMiddleLayers.forward's docstring
-        (D'->D''), generalized to whatever H,W this experiment's SPARSE_BEV_GRID_SIZE
-        uses -- deterministic from config alone."""
-        gs = SparseConv3dDown.output_grid_size(grid_size, 3, (2, 1, 1), (1, 1, 1))
-        gs = SparseConv3dDown.output_grid_size(gs, 3, (1, 1, 1), (0, 1, 1))
-        gs = SparseConv3dDown.output_grid_size(gs, 3, (2, 1, 1), (1, 1, 1))
-        return gs
+        """Pure conv-arithmetic (kernel=3 throughout; same stride/padding triples as
+        __init__ above) -- identical formula to the sparse_ops.py version, still
+        correct regardless of which backend actually computes the convolution."""
+        def out(g, pad, stride):
+            return (g + 2 * pad - 3) // stride + 1
+        D, H, W = grid_size
+        D, H, W = out(D, 1, 2), out(H, 1, 1), out(W, 1, 1)  # conv1
+        D, H, W = out(D, 0, 1), out(H, 1, 1), out(W, 1, 1)  # conv2
+        D, H, W = out(D, 1, 2), out(H, 1, 1), out(W, 1, 1)  # conv3
+        return (D, H, W)
 
-    def forward(self, features, coords, index_grid, grid_size, batch_size):
-        x, c, ig, gs = self.conv1(features, coords, index_grid, grid_size, batch_size)
-        x = self.relu(self.bn1(x))
-        x, c, ig, gs = self.conv2(x, c, ig, gs, batch_size)
-        x = self.relu(self.bn2(x))
-        x, c, ig, gs = self.conv3(x, c, ig, gs, batch_size)
-        x = self.relu(self.bn3(x))
-        return scatter_to_bev(x, c, gs, batch_size, self.out_channels)
+    def forward(self, voxelwise: torch.Tensor, coords: torch.Tensor, grid_size, batch_size: int):
+        x = spconv.SparseConvTensor(voxelwise, coords.int(), spatial_shape=list(grid_size), batch_size=batch_size)
+        x = self.conv1(x)
+        x = x.replace_feature(self.relu(self.bn1(x.features)))
+        x = self.conv2(x)
+        x = x.replace_feature(self.relu(self.bn2(x.features)))
+        x = self.conv3(x)
+        x = x.replace_feature(self.relu(self.bn3(x.features)))
+        dense = x.dense()  # (B, C, D_out, H_out, W_out) -- zeros where nothing was active
+        B_, C_, D_, H_, W_ = dense.shape
+        return dense.reshape(B_, C_ * D_, H_, W_)
 
 
 class SparseBEVConvMiddleVoxelNet(nn.Module):
@@ -113,9 +120,8 @@ class SparseBEVConvMiddleVoxelNet(nn.Module):
     def forward(self, voxel_features: torch.Tensor, num_points: torch.Tensor, coords: torch.Tensor):
         voxelwise = self.vfe(voxel_features, num_points)
         batch_size = int(coords[:, 0].max().item()) + 1 if len(coords) else 1
-        index_grid = build_index_grid(coords, batch_size, self.input_grid_size, device=voxelwise.device)
 
-        feat2d = self.backbone(voxelwise, coords, index_grid, self.input_grid_size, batch_size)
+        feat2d = self.backbone(voxelwise, coords, self.input_grid_size, batch_size)
         if self._project:
             feat2d = self.bev_relu(self.bev_bn(self.bev_project(feat2d)))
 

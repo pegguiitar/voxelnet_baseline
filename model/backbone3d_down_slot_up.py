@@ -1,55 +1,60 @@
-"""Sparse 3D backbone: N-stage downsample encoder (reuses backbone3d.Sparse3DStage
-verbatim) -> SlotFormer (global context on the deepest, most-downsampled voxels --
-fewest active voxels there, so cheapest place to run attention) -> M-stage upsample
-decoder (M configurable, 0 <= M <= N, via sparse_ops.SparseInverseConv3d + skip fusion)
--> optional output projection.
+"""backbone3d_down_slot_up.py - spconv-based sparse 3D backbone: N-stage downsample
+encoder (reuses backbone3d.Sparse3DStage) -> SlotFormer (global context on the
+deepest, most-downsampled voxels -- fewest active voxels there, so cheapest place to
+run attention) -> M-stage upsample decoder (spconv.SparseInverseConv3d + skip
+fusion) -> optional output projection.
 
-Ported from the 3d_point_cloud sibling project's models/backbone3d_down_slot_up.py
-(same design, this file just uses flat imports to match this repo's module layout).
-See that file's docstring for the full design rationale: this generalizes both the
-old encoder-only+external-SlotFormer setup (M=0) and a full sparse-U-Net decoder
-(M=N), with SlotFormer running once at the bottleneck either way.
+2026-09-03: migrated to spconv for the same reason backbone3d.py was -- see that
+file's module docstring and experiments/exp3_conv_middle_bev/voxelnet.py's for the
+full profiling story (the from-scratch sparse_ops.py backward pass was the real
+bottleneck, ~80% of total step time, not backbone depth/SlotFormer -- switching to
+spconv's real CUDA kernels measured a ~4.4x real-training speedup there). Each
+encoder downsample stage gets a unique indice_key so the matching decoder stage's
+spconv.SparseInverseConv3d can invert it via the cached rulebook -- the mechanism
+spconv itself provides for exactly this "paired inverse, not a generative
+transposed conv" design: it never invents a coordinate that wasn't in the
+corresponding downsample's INPUT set, which is what lets a skip-connection merge be
+a plain index-aligned concat instead of a coordinate-hash join.
+
+Public interface intentionally stays close to the old tuple-based one (features,
+coords, grid_size) -- see backbone3d.py's module docstring for why (callers don't
+need to learn the spconv.SparseConvTensor API).
 """
 import torch
 import torch.nn as nn
+import spconv.pytorch as spconv
 
-from backbone3d import Sparse3DStage
-from sparse_ops import SubMConv3d, SparseBasicBlock, SparseInverseConv3d
+from backbone3d import Sparse3DStage, SparseBasicBlock
 from slotformer import SlotFormerBackbone
 
 
 class _DecoderStage(nn.Module):
-    """Inverts one Sparse3DStage's downsample: SparseInverseConv3d restores the
-    cached parent (pre-downsample) coordinate set, concatenates with that stage's
-    cached skip features (same coords -> plain index-aligned concat), a SubMConv3d
-    fuses the concatenated channels back down to skip_channels, then `num_blocks`
-    residual blocks refine at that width."""
+    """Inverts one encoder downsample stage: spconv.SparseInverseConv3d (paired via
+    indice_key with that stage's Sparse3DStage.down) restores the pre-downsample
+    coordinate set/order exactly, so concatenating with the cached skip features is
+    a plain index-aligned concat, then a SubMConv3d fuses the concatenated channels
+    back down to skip_channels, then `num_blocks` residual blocks refine at that
+    width."""
 
-    def __init__(self, in_channels, skip_channels, num_blocks, kernel_size, stride):
+    def __init__(self, in_channels, skip_channels, num_blocks, kernel_size, indice_key):
         super().__init__()
-        self.up = SparseInverseConv3d(in_channels, skip_channels, kernel_size=kernel_size, bias=False)
+        self.up = spconv.SparseInverseConv3d(in_channels, skip_channels, kernel_size,
+                                              indice_key=indice_key, bias=False)
         self.up_bn = nn.BatchNorm1d(skip_channels)
-        self.fuse = SubMConv3d(skip_channels * 2, skip_channels, kernel_size=3, bias=False)
+        self.fuse = spconv.SubMConv3d(skip_channels * 2, skip_channels, kernel_size=3, bias=False)
         self.fuse_bn = nn.BatchNorm1d(skip_channels)
         self.relu = nn.ReLU(inplace=True)
         self.blocks = nn.ModuleList([SparseBasicBlock(skip_channels) for _ in range(num_blocks)])
-        self.stride = stride
-        self.padding = kernel_size // 2
 
-    def forward(self, features, coords, index_grid, grid_size,
-                skip_features, parent_coords, parent_index_grid, parent_grid_size):
-        up_feat, out_coords, out_index_grid = self.up(
-            features, coords, index_grid, grid_size,
-            parent_coords, parent_index_grid, parent_grid_size,
-            stride=self.stride, padding=self.padding,
-        )
-        up_feat = self.relu(self.up_bn(up_feat))
-        x = torch.cat([up_feat, skip_features], dim=1)
-        x, _, _ = self.fuse(x, out_coords, out_index_grid, parent_grid_size)
-        x = self.relu(self.fuse_bn(x))
+    def forward(self, x: spconv.SparseConvTensor, skip: spconv.SparseConvTensor) -> spconv.SparseConvTensor:
+        up = self.up(x)
+        up = up.replace_feature(self.relu(self.up_bn(up.features)))
+        fused = up.replace_feature(torch.cat([up.features, skip.features], dim=1))
+        fused = self.fuse(fused)
+        fused = fused.replace_feature(self.relu(self.fuse_bn(fused.features)))
         for block in self.blocks:
-            x, _, _ = block(x, out_coords, out_index_grid, parent_grid_size)
-        return x, out_coords, out_index_grid, parent_grid_size
+            fused = block(fused)
+        return fused
 
 
 class SparseDownSlotUpBackbone(nn.Module):
@@ -66,7 +71,8 @@ class SparseDownSlotUpBackbone(nn.Module):
         encoder_channels = [in_channels] + stage_channels
 
         self.encoder_stages = nn.ModuleList([
-            Sparse3DStage(encoder_channels[i], encoder_channels[i + 1], num_blocks_per_stage, down_kernel, down_stride)
+            Sparse3DStage(encoder_channels[i], encoder_channels[i + 1], num_blocks_per_stage,
+                          down_kernel, down_stride, indice_key=f"down{i}")
             for i in range(n)
         ])
         self.slotformer = SlotFormerBackbone(stage_channels[-1], slot_win_size, slot_num_cycles, slot_num_heads)
@@ -74,7 +80,8 @@ class SparseDownSlotUpBackbone(nn.Module):
         # Invert only the M *deepest* encoder stages, deepest first -- M=0 -> empty
         # ModuleList (no decoder at all); M=n -> fully restores to input resolution.
         self.decoder_stages = nn.ModuleList([
-            _DecoderStage(encoder_channels[i + 1], encoder_channels[i], decoder_blocks_per_stage, down_kernel, down_stride)
+            _DecoderStage(encoder_channels[i + 1], encoder_channels[i], decoder_blocks_per_stage,
+                          down_kernel, indice_key=f"down{i}")
             for i in reversed(range(n - upsample_stages, n))
         ])
 
@@ -82,28 +89,30 @@ class SparseDownSlotUpBackbone(nn.Module):
         out_channels = decoder_out_channels or final_channels
         self._project = out_channels != final_channels
         if self._project:
-            self.out_conv = SubMConv3d(final_channels, out_channels, kernel_size=3, bias=False)
+            self.out_conv = spconv.SubMConv3d(final_channels, out_channels, kernel_size=3, bias=False)
             self.out_bn = nn.BatchNorm1d(out_channels)
             self.out_relu = nn.ReLU(inplace=True)
 
         self.out_channels = out_channels
         self.total_stride = down_stride ** (n - upsample_stages)
 
-    def forward(self, features, coords, index_grid, grid_size, batch_size):
-        skips = []  # (features, coords, index_grid, grid_size) cached BEFORE each encoder stage runs
-        x, c, ig, gs = features, coords, index_grid, grid_size
-        for stage in self.encoder_stages:
-            skips.append((x, c, ig, gs))
-            x, c, ig, gs = stage(x, c, ig, gs, batch_size)
+    def forward(self, features: torch.Tensor, coords: torch.Tensor, grid_size, batch_size: int):
+        x = spconv.SparseConvTensor(features, coords.int(), spatial_shape=list(grid_size), batch_size=batch_size)
 
-        x = self.slotformer(x, c)  # global context at the coarsest scale -- fewest active voxels here
+        skips = []  # SparseConvTensor cached BEFORE each encoder stage runs
+        for stage in self.encoder_stages:
+            skips.append(x)
+            x = stage(x)
+
+        x = x.replace_feature(self.slotformer(x.features, x.indices.long()))
+        # ↑ global context at the coarsest scale -- fewest active voxels here
 
         for stage in self.decoder_stages:
-            skip_feat, skip_coords, skip_index_grid, skip_grid_size = skips.pop()
-            x, c, ig, gs = stage(x, c, ig, gs, skip_feat, skip_coords, skip_index_grid, skip_grid_size)
+            skip = skips.pop()
+            x = stage(x, skip)
 
         if self._project:
-            x, _, _ = self.out_conv(x, c, ig, gs)
-            x = self.out_relu(self.out_bn(x))
+            x = self.out_conv(x)
+            x = x.replace_feature(self.out_relu(self.out_bn(x.features)))
 
-        return x, c, ig, gs
+        return x.features, x.indices.long(), tuple(x.spatial_shape)

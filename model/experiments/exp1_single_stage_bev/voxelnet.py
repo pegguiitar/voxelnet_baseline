@@ -17,6 +17,16 @@ apples-to-apples comparison of backbone STRUCTURE alone (single-stage vs.
 down-slot-up vs. z-only-stride), rather than each experiment also varying in
 how it collapses to BEV.
 
+2026-09-03: backbone3d.Sparse3DBackbone (imported below) migrated to spconv --
+see that module's docstring and exp3_conv_middle_bev/voxelnet.py's for why
+(the from-scratch sparse_ops.py backward pass was the real bottleneck, ~80% of
+total step time, not backbone depth/SlotFormer). Its (features, coords,
+grid_size) tuple interface is unchanged, just no more index_grid argument
+(spconv manages its own internal indices, so build_index_grid is gone too).
+scatter_to_bev is still used unchanged here -- profiling found it was never
+the bottleneck (its backward is a plain gather over unique indices, not the
+duplicate-index scatter-add pattern that was actually slow).
+
 Reuses config.SPARSE_BACKBONE_*/SPARSE_SLOTFORMER_* (same backbone shape/
 SlotFormer depth as the sparse_voxelnet.py fully-sparse-head experiment) and
 config.SPARSE_BEV_* (voxel size / grid / RPN_IN_CHANNELS) for the BEV side.
@@ -33,16 +43,21 @@ import config
 from model import StackedVFE, RPNCenterHead
 from backbone3d import Sparse3DBackbone
 from slotformer import SlotFormerBackbone
-from sparse_ops import build_index_grid, SparseConv3dDown, scatter_to_bev
+from sparse_ops import scatter_to_bev
 
 
 def _stage_grid_sizes(grid_size, num_stages, kernel, stride):
     """[grid_size, size after stage 1, ..., size after stage num_stages] --
-    deterministic from config alone (same arithmetic SparseConv3dDown.forward uses)."""
+    deterministic from config alone (pure conv-arithmetic, independent of which
+    backend actually computes the convolution)."""
     padding = kernel // 2
+
+    def out(g):
+        return (g + 2 * padding - kernel) // stride + 1
+
     sizes = [tuple(grid_size)]
     for _ in range(num_stages):
-        sizes.append(SparseConv3dDown.output_grid_size(sizes[-1], kernel, stride, padding))
+        sizes.append(tuple(out(g) for g in sizes[-1]))
     return sizes
 
 
@@ -72,8 +87,8 @@ class SingleStageBEVBackbone(nn.Module):
     def output_grid_size(self, grid_size):
         return _stage_grid_sizes(grid_size, self._num_stages, self._kernel, self._stride)[-1]
 
-    def forward(self, voxelwise, coords, index_grid, grid_size, batch_size):
-        x, c, _, gs = self.backbone(voxelwise, coords, index_grid, grid_size, batch_size)
+    def forward(self, voxelwise, coords, grid_size, batch_size):
+        x, c, gs = self.backbone(voxelwise, coords, grid_size, batch_size)
         if self.use_slotformer:
             x = self.slotformer(x, c)
         return scatter_to_bev(x, c, gs, batch_size, self.out_channels)
@@ -125,9 +140,8 @@ class SparseBEVSingleStageVoxelNet(nn.Module):
     def forward(self, voxel_features: torch.Tensor, num_points: torch.Tensor, coords: torch.Tensor):
         voxelwise = self.vfe(voxel_features, num_points)
         batch_size = int(coords[:, 0].max().item()) + 1 if len(coords) else 1
-        index_grid = build_index_grid(coords, batch_size, self.input_grid_size, device=voxelwise.device)
 
-        feat2d = self.backbone(voxelwise, coords, index_grid, self.input_grid_size, batch_size)
+        feat2d = self.backbone(voxelwise, coords, self.input_grid_size, batch_size)
         if self._project:
             feat2d = self.bev_relu(self.bev_bn(self.bev_project(feat2d)))
 
