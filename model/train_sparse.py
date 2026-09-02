@@ -1,0 +1,221 @@
+"""train_sparse.py - training entry point for the sparse (no-BEV-collapse) backbone
+experiment (sparse_voxelnet.py), on the 3d_point_cloud sibling project's real sonar
+data (sonar_diver_dataset.py). Separate from train.py (this repo's own dense/anchor
+and dense/center recipes) rather than adding flags there -- keeps the existing
+confirmed baseline recipe (model/README.md) untouched while this stays a standalone
+backbone-swap experiment.
+
+Unlike the dense pipeline's cached targets (heatmap_targets baked once per frame into
+the npz cache, valid forever since the dense grid is fixed), sparse targets depend on
+which voxels the backbone actually keeps for THIS batch -- so build_sparse_targets runs
+every step, after the forward pass, not at cache/dataset time.
+
+Usage:
+    python train_sparse.py --ckpt_dir checkpoints_sparse
+    python train_sparse.py --ckpt_dir checkpoints_sparse --resume checkpoints_sparse/last.pth
+"""
+import argparse
+import csv
+import time
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+import config
+from sonar_diver_dataset import SonarDiverDataset, collate_fn
+from sparse_voxelnet import SparseVoxelNet
+from sparse_center_head import build_sparse_targets, sparse_center_loss, decode_sparse_center_boxes
+from eval_sparse import evaluate_test_ap, IOU_THRESHOLDS as TEST_AP_IOU_THRESHOLDS
+
+LOSS_KEYS = ["hm_loss", "reg_loss", "offset_loss", "dim_loss", "rot_loss", "density_loss"]
+AP_KEYS = [f"ap_iou{int(t * 100)}" for t in TEST_AP_IOU_THRESHOLDS]  # ap_iou30, ap_iou35, ap_iou40
+
+
+class LossLogger:
+    """Same shape/append-safety as 3d_point_cloud/train.py's LossLogger -- one CSV row
+    per train step and per val epoch, flushed every row so a Colab disconnect loses
+    nothing, reopening an existing file appends instead of overwriting."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not self.path.exists()
+        self.file = open(self.path, "a", newline="")
+        self.writer = csv.writer(self.file)
+        if is_new:
+            self.writer.writerow(["phase", "epoch", "step", "lr", "n_pos", "total"] + LOSS_KEYS + AP_KEYS)
+            self.file.flush()
+
+    def log(self, phase, epoch, step, lr, total, stats, ap_by_thresh=None):
+        ap_by_thresh = ap_by_thresh or {}
+        ap_cols = [ap_by_thresh.get(t, "") for t in TEST_AP_IOU_THRESHOLDS]
+        self.writer.writerow([phase, epoch, step, lr, stats.get("n_pos", ""), total] +
+                              [stats.get(k, "") for k in LOSS_KEYS] + ap_cols)
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
+def build_dataloader(split, batch_size, shuffle, num_workers):
+    ds = SonarDiverDataset(split)
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers,
+                       collate_fn=collate_fn, drop_last=shuffle, pin_memory=True,
+                       persistent_workers=(num_workers > 0))
+
+
+def run_step(model, batch, device):
+    voxel_features = batch["voxel_features"].to(device, non_blocking=True)
+    num_points = batch["num_points"].to(device, non_blocking=True)
+    coords = batch["coords"].to(device, non_blocking=True)
+    gt_boxes_list = [g.to(device) for g in batch["gt_boxes"]]
+
+    pred, out_coords, _ = model(voxel_features, num_points, coords)
+    target = build_sparse_targets(gt_boxes_list, out_coords, model.stride)
+    loss, stats = sparse_center_loss(pred, target)
+    return loss, stats
+
+
+@torch.no_grad()
+def run_validation(model, val_loader, device):
+    model.eval()
+    sums = {k: 0.0 for k in LOSS_KEYS}
+    total_sum, n = 0.0, 0
+    for batch in val_loader:
+        loss, stats = run_step(model, batch, device)
+        total_sum += loss.item()
+        for k in LOSS_KEYS:
+            sums[k] += stats.get(k, 0.0)
+        n += 1
+    model.train()
+    n = max(n, 1)
+    avg_stats = {k: v / n for k, v in sums.items()}
+    return total_sum / n, avg_stats
+
+
+def save_checkpoint(path, model, optimizer, scheduler, epoch, step, epoch_complete):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(), "epoch": epoch, "step": step,
+        "epoch_complete": epoch_complete,
+    }, path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt_dir", default="checkpoints_sparse")
+    parser.add_argument("--resume", default=None)
+    parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS)
+    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=config.LR)
+    parser.add_argument("--weight_decay", type=float, default=config.WEIGHT_DECAY)
+    parser.add_argument("--pct_start", type=float, default=0.1, help="OneCycleLR warmup fraction")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--ckpt_every_epochs", type=int, default=1)
+    parser.add_argument("--ckpt_every_steps", type=int, default=1000)
+    parser.add_argument("--log_file", default=None)
+    parser.add_argument("--test_eval_every_n_epochs", type=int, default=1,
+                         help="run the AP3D@0.3/0.35/0.4 test-set check every N epochs (0 to disable)")
+    parser.add_argument("--test_eval_max_frames", type=int, default=500,
+                         help="cap test frames scored per check (measured ~0.075s/frame on an untrained "
+                              "model -- the full 8112-frame test split would add ~10+ min/epoch; pass "
+                              "None-equivalent by setting a large number, or 0 to use the whole split)")
+    parser.add_argument("--test_eval_score_thresh", type=float, default=0.1)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
+    if device.type == "cpu":
+        print("WARNING: no CUDA GPU found -- this will be very slow.")
+
+    train_loader = build_dataloader("train", args.batch_size, shuffle=True, num_workers=args.num_workers)
+    val_loader = build_dataloader("val", args.batch_size, shuffle=False, num_workers=args.num_workers)
+    test_loader = build_dataloader("test", args.batch_size, shuffle=False, num_workers=args.num_workers) \
+        if args.test_eval_every_n_epochs > 0 else None
+    print(f"train batches/epoch: {len(train_loader)}  val batches: {len(val_loader)}"
+          + (f"  test batches: {len(test_loader)}" if test_loader is not None else ""))
+
+    model = SparseVoxelNet().to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"params: {n_params:,}  backbone stride: {model.stride}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * args.epochs
+
+    start_epoch, global_step = 0, 0
+    ckpt = None
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1 if ckpt.get("epoch_complete") else ckpt["epoch"]
+        global_step = ckpt["step"]
+        print(f"resumed from {args.resume} at epoch {start_epoch}, step {global_step}")
+
+    # Same reasoning as 3d_point_cloud/train.py: rebuild fresh, sized off THIS run's
+    # steps_per_epoch/epochs, rather than restoring the scheduler's own state -- so a
+    # resume after --epochs or --batch_size changed can't inherit a stale total_steps.
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=args.lr, total_steps=total_steps,
+        pct_start=args.pct_start, div_factor=25,
+        last_epoch=(global_step - 1) if ckpt is not None else -1,
+    )
+
+    ckpt_dir = Path(args.ckpt_dir)
+    log_path = Path(args.log_file) if args.log_file else ckpt_dir / "loss_history.csv"
+    logger = LossLogger(log_path)
+    print(f"logging to {log_path}")
+
+    model.train()
+    for epoch in range(start_epoch, args.epochs):
+        epoch_t0 = time.time()
+        running_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs - 1}")
+        for batch in pbar:
+            loss, stats = run_step(model, batch, device)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_NORM)
+            optimizer.step()
+            scheduler.step()
+            global_step += 1
+            running_loss += loss.item()
+            lr = scheduler.get_last_lr()[0]
+            logger.log("train", epoch, global_step, lr, loss.item(), stats)
+            pbar.set_postfix({"loss": f"{loss.item():.3f}", "hm": f"{stats['hm_loss']:.3f}",
+                               "n_pos": stats["n_pos"], "lr": f"{lr:.2e}"})
+
+            if args.ckpt_every_steps and global_step % args.ckpt_every_steps == 0:
+                save_checkpoint(ckpt_dir / f"step_{global_step}.pth", model, optimizer, scheduler,
+                                 epoch, global_step, epoch_complete=False)
+
+        epoch_time = time.time() - epoch_t0
+        avg_train_loss = running_loss / max(len(train_loader), 1)
+        val_loss, val_stats = run_validation(model, val_loader, device)
+        logger.log("val", epoch, global_step, "", val_loss, val_stats)
+        print(f"epoch {epoch}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} time={epoch_time:.1f}s")
+
+        if test_loader is not None and (epoch + 1) % args.test_eval_every_n_epochs == 0:
+            max_frames = None if not args.test_eval_max_frames else args.test_eval_max_frames
+            ap_by_thresh, ap_time = evaluate_test_ap(
+                model, test_loader, device, score_thresh=args.test_eval_score_thresh,
+                max_frames=max_frames)
+            logger.log("test", epoch, global_step, "", "", {}, ap_by_thresh=ap_by_thresh)
+            ap_str = "  ".join(f"AP@{t:.2f}={ap_by_thresh[t]:.4f}" for t in TEST_AP_IOU_THRESHOLDS)
+            print(f"  test AP3D ({ap_time:.1f}s): {ap_str}")
+
+        if args.ckpt_every_epochs and (epoch + 1) % args.ckpt_every_epochs == 0:
+            save_checkpoint(ckpt_dir / f"epoch_{epoch}.pth", model, optimizer, scheduler,
+                             epoch, global_step, epoch_complete=True)
+
+    save_checkpoint(ckpt_dir / "last.pth", model, optimizer, scheduler, args.epochs - 1, global_step, epoch_complete=True)
+    logger.close()
+    print("training complete.")
+
+
+if __name__ == "__main__":
+    main()

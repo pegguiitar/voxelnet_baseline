@@ -64,6 +64,73 @@ RPN_BLOCK_CHANNELS = (128, 128, 256)
 RPN_BLOCK_LAYERS = (4, 6, 6)  # 각 block의 총 conv 수 (첫 conv가 stride2 downsample)
 RPN_UPSAMPLE_CHANNELS = 256  # 각 deconv 출력 채널 (concat 전)
 
+# --- Sparse 3D backbone (sparse_voxelnet.py) -- BEV로 압축하지 않는 대안 경로.
+# ConvMiddleLayers(z를 채널로 눌러 BEV로 만듦) + RPNBackbone(2D CNN)을 통째로 대체한다.
+# head(sparse_center_head.py)는 baseline RPNCenterHead와 동일한 목표(heatmap/offset/
+# dim/rot6D/density)를 유지하되 dense (B,C,H,W) 대신 sparse (N,C) 위에서 동작하도록
+# 차원만 바꾼 버전 -- backbone 쪽만 실험적으로 바꿔가며 비교하기 위한 스캐폴딩.
+# 단일 스테이지/stride 2 기본값은 3d_point_cloud(자매 프로젝트)에서 다이버 탐지에
+# 검증된 값 그대로 재사용 -- 4단계/stride 16처럼 깊게 다운샘플하면 최종 해상도가
+# 다이버 크기보다 커져 precision/recall이 무너지는 걸 그 프로젝트에서 직접 겪었다.
+SPARSE_BACKBONE_STAGE_CHANNELS = (128,)      # 단일 스테이지, VFE 출력(128)과 동일 폭 유지
+SPARSE_BACKBONE_NUM_BLOCKS_PER_STAGE = 3
+SPARSE_BACKBONE_DOWNSAMPLE_KERNEL = 3
+SPARSE_BACKBONE_DOWNSAMPLE_STRIDE = 2         # 총 다운샘플 배율 = stride^(len(STAGE_CHANNELS))
+
+# --- sonar_diver_dataset.py 전용 (3d_point_cloud 자매 프로젝트의 diver sonar 데이터) ---
+# 이 데이터는 Triband_BEV와 물리적 커버리지 자체가 다르므로(원점 기준 훨씬 넓은 범위),
+# 위 POINT_CLOUD_RANGE/VOXEL_SIZE(RPN_IN_CHANNELS 등 dense 파이프라인 전체가 이 값에
+# 맞춰 캘리브레이션됨)를 덮어쓰지 않고 별도 상수로 둔다 - sparse 경로(sparse_voxelnet.py/
+# sparse_center_head.py/train_sparse.py)만 이걸 읽는다.
+# VOXEL_SIZE=0.1 (2026-09-01, was 0.2): dense baseline의 x,y 유효 해상도가 정확히
+# 0.2m(VOXEL_SIZE[0]=0.1 x ANCHOR_STRIDE의 다운샘플 2배)였다는 걸 확인한 뒤, sparse
+# 경로도 같은 유효 해상도(0.1 x backbone stride 2 = 0.2m)로 맞춰 "해상도는 동일, z를
+# 채널로 누르느냐 아니냐만 다른" 공정한 backbone 비교가 되도록 조정. 3d-point-cloud에서
+# 이 정확히 같은 변경(0.2->0.1)이 활성 voxel 수를 크게 늘려 안전한 배치 크기가 8~12에서
+# 2~4로 떨어진 전례가 있음 - 배치 크기는 이 변경 후 반드시 실측으로 재검증할 것.
+SPARSE_POINT_CLOUD_RANGE = (0.0, -11.4, -5.6, 16.2, 11.4, 5.6)
+SPARSE_VOXEL_SIZE = (0.1, 0.1, 0.1)
+SPARSE_GRID_SIZE = tuple(round((SPARSE_POINT_CLOUD_RANGE[3 + i] - SPARSE_POINT_CLOUD_RANGE[i]) / SPARSE_VOXEL_SIZE[i])
+                          for i in range(3))  # (W',H',D')=(x,y,z) counts, config.GRID_SIZE와 동일 관례
+SPARSE_MAX_POINTS_PER_VOXEL = 35
+SPARSE_MAX_VOXELS = 40000  # 0.1m에서는 프레임당 활성 voxel이 0.2m 대비 최대 8배까지 늘 수 있음
+
+# sparse 백본 출력 위에 얹는 축별(axial) 슬롯 어텐션 refinement -- models/slotformer.py
+# (3d_point_cloud 자매 프로젝트에서 검증된 구현 그대로 포팅). dense 경로는 이미 RPNBackbone이
+# 전체 그리드를 컨볼브해서 receptive field가 넓으므로 SlotFormer가 필요 없고, sparse 경로만
+# 적용 대상.
+# WIN_SIZE=24: 3d_point_cloud의 WIN_SIZE=12는 그 프로젝트 유효 해상도 0.4m 기준 물리적
+# 윈도우 4.8m -- 이 프로젝트의 sparse 유효 해상도는 0.2m(SPARSE_VOXEL_SIZE 0.1 x backbone
+# stride 2)이므로 같은 4.8m 물리적 윈도우를 맞추려면 24칸이 필요 (4.8 / 0.2 = 24).
+# NUM_CYCLES=2 (x,y,z 두 바퀴 = 6 레이어, 2026-09-01: 3L에서 변경). 3d_point_cloud의 6L은
+# 학습 도중 사용자 요청으로 epoch 2에서 중단돼 3L과의 최종 비교가 안 끝났음 -- 여기서
+# 끝까지 학습해서 직접 비교.
+SPARSE_SLOTFORMER_ENABLED = True
+SPARSE_SLOTFORMER_WIN_SIZE = 24
+SPARSE_SLOTFORMER_NUM_CYCLES = 2
+SPARSE_SLOTFORMER_NUM_HEADS = 4
+
+# sparse_voxelnet_down_slot_up.py 전용 -- 4단계 다운샘플 encoder -> SlotFormer(bottleneck,
+# 가장 적은 active voxel에서 돌려서 제일 쌈) -> 4단계 업샘플 decoder(완전 복원, stride=1).
+# 3d_point_cloud 자매 프로젝트의 backbone3d_down_slot_up.py와 동일 설계, 이식.
+SPARSE_DOWN_SLOT_UP_STAGE_CHANNELS = (64, 96, 128, 128)
+SPARSE_DOWN_SLOT_UP_NUM_BLOCKS_PER_STAGE = 2
+SPARSE_DOWN_SLOT_UP_DOWNSAMPLE_KERNEL = 3
+SPARSE_DOWN_SLOT_UP_DOWNSAMPLE_STRIDE = 2
+SPARSE_DOWN_SLOT_UP_UPSAMPLE_STAGES = 4       # =len(STAGE_CHANNELS) -> 완전 복원 (stride=1)
+SPARSE_DOWN_SLOT_UP_DECODER_BLOCKS_PER_STAGE = 2
+# WIN_SIZE=3: bottleneck 유효 해상도 = SPARSE_VOXEL_SIZE(0.1) * stride^4(16) = 1.6m/voxel.
+# 물리적 윈도우 ~4.8m를 맞추려면 4.8/1.6=3 (기존 단일 스테이지 백본의 WIN_SIZE=24는
+# bottleneck 해상도가 0.2m였을 때 값 -- 인코더가 훨씬 깊어져서 voxel 하나가 이미 넓은
+# 공간을 커버하므로 같은 물리적 크기를 맞추려면 훨씬 작은 숫자가 필요).
+SPARSE_DOWN_SLOT_UP_SLOTFORMER_WIN_SIZE = 3
+SPARSE_DOWN_SLOT_UP_SLOTFORMER_NUM_CYCLES = 2  # 6L
+SPARSE_DOWN_SLOT_UP_SLOTFORMER_NUM_HEADS = 4
+# 경고: 이 조합(4단계 다운 + 4단계 완전 복원 + SlotFormer, VOXEL_SIZE=0.1)은 3d_point_cloud
+# 자매 프로젝트의 `unet` 브랜치(디코더만, SlotFormer 없음)가 A100에서도 epoch당 3시간+
+# 걸렸던 것과 같은 비용 구조(decoder 얕은 단계가 거의 원본 해상도의 voxel 수를 처리)를
+# 그대로 가짐 -- 실제 학습 전에 반드시 실측(메모리/속도) 먼저 할 것.
+
 # --- 학습 ---
 BATCH_SIZE = 4
 NUM_EPOCHS = 30
