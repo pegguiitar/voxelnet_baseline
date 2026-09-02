@@ -92,6 +92,50 @@ python smoke_test.py                          # structural check, synthetic data
 python train.py --ckpt_dir checkpoints_exp1_single_stage_bev --batch_size <N> --epochs 20
 ```
 
+### Run exp2_down_slot_up_bev now (status: not yet run as of this push)
+
+exp3 is running a 20-epoch real-data training pass elsewhere as of this push (and
+will auto-chain into exp1 afterward, same machine) -- **exp2 is free to pick up in
+parallel on another machine/agent right now**, no coordination needed (separate
+checkpoint dirs, doesn't touch exp3/exp1's files). Exact commands:
+
+```bash
+git clone -b sparse https://github.com/pegguiitar/voxelnet_baseline.git voxelnet_baseline   # or git checkout sparse && git pull
+cd voxelnet_baseline/model
+python -m venv .venv && .venv\Scripts\activate           # Windows; source .venv/bin/activate elsewhere
+pip install torch --index-url https://download.pytorch.org/whl/cu126   # match your driver's CUDA
+pip install spconv-cu126   # match your CUDA version instead if not cu126
+
+cd experiments/exp2_down_slot_up_bev
+python smoke_test.py   # ~1 min, synthetic data, confirms the environment/spconv install works first
+
+python train.py --ckpt_dir checkpoints_exp2_down_slot_up_bev --num_workers 4 --epochs 20
+```
+
+Needs `labeling-tool-main` cloned as a **sibling** directory to `voxelnet_baseline`
+(`sonar_diver_dataset.py` reads from `../labeling-tool-main/dataset` directly, no
+separate download/cache step). `train.py` writes `checkpoints_exp2_down_slot_up_bev/
+loss_history.csv` (per-step train loss, and per-epoch val loss + AP3D/precision/
+recall at IoU 0.25/0.3/0.35/0.4/0.5 -- see "Per-epoch validation metrics" below) and
+`epoch_{N}.pth`/`last.pth` checkpoints there; `--resume checkpoints_exp2_down_slot_up_bev/last.pth`
+continues an interrupted run. Expect roughly 2.5 it/s / ~35min/epoch on an 8GB card
+(measured on an RTX 2070) -- not yet run for a full 20 epochs anywhere, so post
+real numbers back once it finishes.
+
+### Per-epoch validation metrics (`eval_bev.py`)
+
+All 4 `train.py`s (exp1/exp2/exp3/dense_baseline) log the exact same per-epoch val
+metric set the confirmed dense-pipeline baseline uses (`model/train.py`'s
+`VAL_LOG_IOUS`/`compute_ap`): AP3D, precision, and recall at IoU
+0.25/0.30/0.35/0.40/0.50 (0.35 is the baseline's own primary/reported threshold),
+via Monte-Carlo OBB IoU (`eval_voxelnet.iou_3d_obb`) on a capped, fixed-seed sample
+of the val split (`--val_ap_max_frames`, default 500 -- scoring the full ~8000-frame
+val split every epoch would dominate total training time). Stdout prints the
+AP@{0.30,0.35,0.40} subset each epoch; the full 15 columns (`ap_iou25`,
+`precision_iou25`, `recall_iou25`, ... `ap_iou50`, `precision_iou50`,
+`recall_iou50`) land in `loss_history.csv`'s `phase="val"` rows. Disable with
+`--val_ap_every_n_epochs 0` if you just want loss curves.
+
 ### Backend: spconv, not this repo's own sparse_ops.py
 
 All 3 backbones above are now built on **spconv** (traveller59/spconv2, package
