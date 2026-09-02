@@ -31,11 +31,16 @@ import config
 from sonar_diver_dataset import SonarDiverDataset, collate_fn
 from sparse_bev_head import build_bev_targets, decode_bev_center_boxes
 from center_loss import center_voxelnet_loss
+from eval_bev import evaluate_bev_ap, IOU_THRESHOLDS as VAL_AP_IOU_THRESHOLDS, PRINT_IOUS as VAL_AP_PRINT_IOUS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from voxelnet import SparseBEVDownSlotUpVoxelNet  # noqa: E402
 
 LOSS_KEYS = ["hm_loss", "reg_loss", "offset_loss", "z_loss", "dim_loss", "rot_loss", "density_loss"]
+AP_KEYS = []  # ap_iou25, precision_iou25, recall_iou25, ap_iou30, ... (matches
+for _t in VAL_AP_IOU_THRESHOLDS:  # model/train.py's own per-epoch val metric set, VAL_LOG_IOUS)
+    _tag = int(round(_t * 100))
+    AP_KEYS += [f"ap_iou{_tag}", f"precision_iou{_tag}", f"recall_iou{_tag}"]
 
 
 class LossLogger:
@@ -46,12 +51,16 @@ class LossLogger:
         self.file = open(self.path, "a", newline="")
         self.writer = csv.writer(self.file)
         if is_new:
-            self.writer.writerow(["phase", "epoch", "step", "lr", "n_pos", "total"] + LOSS_KEYS)
+            self.writer.writerow(["phase", "epoch", "step", "lr", "n_pos", "total"] + LOSS_KEYS + AP_KEYS)
             self.file.flush()
 
-    def log(self, phase, epoch, step, lr, total, stats):
+    def log(self, phase, epoch, step, lr, total, stats, metrics_by_thresh=None):
+        metrics_by_thresh = metrics_by_thresh or {}
+        ap_cols = []
+        for t in VAL_AP_IOU_THRESHOLDS:
+            ap_cols += list(metrics_by_thresh.get(t, ("", "", "")))
         self.writer.writerow([phase, epoch, step, lr, stats.get("n_pos", ""), total] +
-                              [stats.get(k, "") for k in LOSS_KEYS])
+                              [stats.get(k, "") for k in LOSS_KEYS] + ap_cols)
         self.file.flush()
 
     def close(self):
@@ -130,6 +139,11 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--ckpt_every_epochs", type=int, default=1)
     parser.add_argument("--ckpt_every_steps", type=int, default=1000)
+    parser.add_argument("--val_ap_every_n_epochs", type=int, default=1,
+                         help="0 disables -- compute AP3D@IoU(0.30/0.35/0.40) on (a subsample of) the val split")
+    parser.add_argument("--val_ap_max_frames", type=int, default=500,
+                         help="cap frames scored per AP check (Monte-Carlo IoU is expensive; 0 = whole val split)")
+    parser.add_argument("--val_ap_score_thresh", type=float, default=0.1)
     parser.add_argument("--log_file", default=None)
     args = parser.parse_args()
 
@@ -198,8 +212,21 @@ def main():
         epoch_time = time.time() - epoch_t0
         avg_train_loss = running_loss / max(len(train_loader), 1)
         val_loss, val_stats = run_validation(model, val_loader, device)
-        logger.log("val", epoch, global_step, "", val_loss, val_stats)
-        print(f"epoch {epoch}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} time={epoch_time:.1f}s")
+
+        metrics_by_thresh = None
+        if args.val_ap_every_n_epochs and (epoch + 1) % args.val_ap_every_n_epochs == 0:
+            max_frames = None if not args.val_ap_max_frames else args.val_ap_max_frames
+            metrics_by_thresh, ap_time = evaluate_bev_ap(
+                model, val_loader, device, score_thresh=args.val_ap_score_thresh, max_frames=max_frames)
+
+        logger.log("val", epoch, global_step, "", val_loss, val_stats, metrics_by_thresh=metrics_by_thresh)
+        msg = f"epoch {epoch}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} time={epoch_time:.1f}s"
+        if metrics_by_thresh is not None:
+            # stdout stays terse (PRINT_IOUS subset, AP only); the full IOU_THRESHOLDS
+            # set (AP+precision+recall each) still goes to the CSV via logger.log above.
+            ap_str = "  ".join(f"AP@{t:.2f}={metrics_by_thresh[t][0]:.4f}" for t in VAL_AP_PRINT_IOUS)
+            msg += f"  ({ap_time:.1f}s) {ap_str}"
+        print(msg)
 
         if args.ckpt_every_epochs and (epoch + 1) % args.ckpt_every_epochs == 0:
             save_checkpoint(ckpt_dir / f"epoch_{epoch}.pth", model, optimizer, scheduler,
