@@ -48,6 +48,49 @@ fine 0.1m voxel size) is architecturally similar to the `3d-point-cloud` project
 `unet` branch, which measured 3+ hours/epoch even on an A100 -- time a handful of
 real steps before committing to a full run (see "Measuring before training" below).
 
+## BEV backbone experiments (`model/experiments/`)
+
+A second comparison series, alongside the fully-sparse-head experiment above: three
+sparse backbone STRUCTURES, each wrapped so the backbone itself outputs a dense BEV
+feature map directly (scatter-to-dense + z-into-channels merge happens inside the
+backbone via `sparse_ops.scatter_to_bev`, not in the caller), then fed to
+`RPNCenterHead` (the original dense pipeline's head, unchanged) instead of the
+sparse-per-voxel `SparseCenterHead`. Each experiment is self-contained
+(`voxelnet.py`/`train.py`/`smoke_test.py`) but shares `config.py`, `sparse_ops.py`,
+`model.py`, `sparse_bev_head.py` from `model/` (the parent directory).
+
+All 3 use the same `SPARSE_BEV_*` voxelization settings (`VOXEL_SIZE=(0.1,0.1,0.5)`,
+same point cloud range/grid as the dense baseline's x,y) and the same BEV-collapse
+method (plain scatter+reshape, no learned z-conv) so the comparison isolates backbone
+STRUCTURE alone:
+
+| experiment | backbone | SlotFormer | x,y downsampled by backbone? |
+|---|---|---|---|
+| `exp1_single_stage_bev` | `backbone3d.Sparse3DBackbone`, 1 stage (`SPARSE_BACKBONE_*`) | external, 2 cycles (6L) | yes (isotropic stride) |
+| `exp2_down_slot_up_bev` | `backbone3d_down_slot_up.SparseDownSlotUpBackbone`, 4-stage down + 4-stage full restore (`SPARSE_BEV_*`) | built into the backbone, at the bottleneck | yes (isotropic stride), but decoder restores back to input resolution |
+| `exp3_zdown_bev` | z-ONLY-stride sparse conv (`SPARSE_BEV_ZDOWN_*`), mirrors the original VoxelNet's `ConvMiddleLayers` philosophy | external, 2 cycles (6L), win_size=48 (x,y never shrink) | **no** -- only z shrinks |
+
+Run from inside each experiment's own folder (each inserts `model/`'s path via
+`sys.path` so `import config`/`from model import ...`/etc. resolve to the shared
+parent modules):
+
+```bash
+cd model/experiments/exp1_single_stage_bev   # or exp2_down_slot_up_bev / exp3_zdown_bev
+python smoke_test.py                          # structural check, synthetic data, no dataset needed
+python train.py --ckpt_dir checkpoints_exp1_single_stage_bev --batch_size <N> --epochs 20
+```
+
+**Not yet measured on real GPU hardware for exp1/exp2** at the time this was written
+-- only verified structurally via each `smoke_test.py`. `exp3_zdown_bev` surfaced (and
+`sparse_ops.py`'s `SparseConv3dDown` now fixes) a real bug: a stride==1 axis (x,y
+here) used to loop over the full kernel window when generating output candidate
+coordinates, "dilating" the active voxel set outward every stage even though nothing
+was being downsampled there -- compounding across 4 stages this caused a CUDA OOM
+from just 800 synthetic input voxels. Fixed by restricting stride==1 axes to a single
+center-tap candidate (true submanifold behavior there, matching `SubMConv3d`), which
+does not affect the other two experiments (both use isotropic stride, no stride==1
+axis exists for them).
+
 ## Setup
 
 ```bash

@@ -14,9 +14,12 @@ local x=length/y=width/z=height) -- both this repo and the labeling tool that pr
 these labels trace back to the same labelCloud convention (see rotation3d.py's
 docstring), so no re-derivation from quaternion is needed.
 
-TRAINVAL_SCENES/TEST_SCENES mirror 3d-point-cloud/configs/default.yaml as of
-2026-09-01 (28 trainval + 8 test scenes) -- keep in sync by hand if that config
-changes; there's no shared source of truth between the two repos.
+TRAIN_SCENES/VAL_SCENES/TEST_SCENES (2026-09-02): explicit SCENE-level 3-way split,
+replacing the previous TRAINVAL_SCENES + frame-level random split (VAL_FRAME_RATIO/
+SPLIT_SEED) -- val is now held-out scenes just like test, not a random subsample of
+frames from scenes the model also trains on. TEST_SCENES is unchanged (same 8 scenes
+as before); VAL_SCENES pulls 7 specific scenes out of the old 28-scene TRAINVAL pool,
+leaving 21 for TRAIN_SCENES.
 """
 
 import json
@@ -37,18 +40,20 @@ TEST_SCENES = [
     "Person4/scene_0077", "Person4/scene_0088", "Person2/scene_0089", "Person4/scene_0093",
 ]
 
-TRAINVAL_SCENES = [
-    "Person2/scene_0050", "Person2/scene_0091", "Person2/scene_0079", "Person2/scene_0078",
-    "Person3/scene_0019", "Person1/scene_0068", "Person1/scene_0063", "Person3/scene_0022",
-    "Person4/scene_0090", "Person3/scene_0080", "Person4/scene_0074", "Person1/scene_0036",
-    "Person3/scene_0064", "Person1/scene_0042", "Person3/scene_0048", "Person3/scene_0072",
-    "Person4/scene_0075", "Person1/scene_0049", "Person4/scene_0021", "Person2/scene_0009",
-    "Person3/scene_0082", "Person1/scene_0000", "Person1/scene_0044", "Person3/scene_0070",
-    "Person2/scene_0076", "Person3/scene_0092", "Person4/scene_0065", "Person4/scene_0081",
+VAL_SCENES = [
+    "Person2/scene_0009", "Person3/scene_0019", "Person1/scene_0049", "Person3/scene_0064",
+    "Person4/scene_0075", "Person4/scene_0090", "Person3/scene_0092",
 ]
 
-VAL_FRAME_RATIO = 0.1
-SPLIT_SEED = 42
+# The old 28-scene TRAINVAL_SCENES pool minus VAL_SCENES above (21 remaining).
+TRAIN_SCENES = [
+    "Person2/scene_0050", "Person2/scene_0091", "Person2/scene_0079", "Person2/scene_0078",
+    "Person1/scene_0068", "Person1/scene_0063", "Person3/scene_0022", "Person3/scene_0080",
+    "Person4/scene_0074", "Person1/scene_0036", "Person1/scene_0042", "Person3/scene_0048",
+    "Person3/scene_0072", "Person4/scene_0021", "Person3/scene_0082", "Person1/scene_0000",
+    "Person1/scene_0044", "Person3/scene_0070", "Person2/scene_0076", "Person4/scene_0065",
+    "Person4/scene_0081",
+]
 
 
 def _list_scene_frames(root: Path, scene_ids: list) -> list:
@@ -89,26 +94,31 @@ def _load_gt_boxes(sonar_path: Path) -> np.ndarray:
     return np.stack(rows).astype(np.float32)
 
 
-class SonarDiverDataset(Dataset):
-    """split: "train"/"val" (frame-level random split of TRAINVAL_SCENES, seeded) or
-    "test" (whole held-out scenes, TEST_SCENES) -- exact same split semantics as
-    3d_point_cloud/data/dataset.py's SonarDiverDataset."""
+_SPLIT_SCENES = {"train": TRAIN_SCENES, "val": VAL_SCENES, "test": TEST_SCENES}
 
-    def __init__(self, split: str):
+
+class SonarDiverDataset(Dataset):
+    """split: "train"/"val"/"test" -- each a disjoint set of whole scenes
+    (TRAIN_SCENES/VAL_SCENES/TEST_SCENES), no frame-level split within a scene.
+    Unlike 3d_point_cloud/data/dataset.py's SonarDiverDataset (still a frame-level
+    random split of a pooled TRAINVAL_SCENES for train/val), val here is held out
+    at the scene level exactly like test."""
+
+    def __init__(self, split: str, point_cloud_range=None, voxel_size=None,
+                 max_points_per_voxel=None, max_voxels=None):
+        """point_cloud_range/voxel_size/max_points_per_voxel/max_voxels: override the
+        default config.SPARSE_* voxelization params -- e.g. experiments/*_bev/voxelnet.py's
+        experiment passes config.SPARSE_BEV_* instead (coarser z voxel size, see that
+        module's docstring for why). Defaults keep sparse_voxelnet.py's existing calls
+        (SonarDiverDataset(split)) unchanged."""
         assert split in ("train", "val", "test")
         self.split = split
         self.root = DATASET_ROOT
-
-        if split == "test":
-            self.samples = _list_scene_frames(self.root, TEST_SCENES)
-        else:
-            import random
-            all_frames = _list_scene_frames(self.root, TRAINVAL_SCENES)
-            all_frames.sort(key=lambda p: str(p))
-            rng = random.Random(SPLIT_SEED)
-            rng.shuffle(all_frames)
-            n_val = round(len(all_frames) * VAL_FRAME_RATIO)
-            self.samples = all_frames[:n_val] if split == "val" else all_frames[n_val:]
+        self.samples = _list_scene_frames(self.root, _SPLIT_SCENES[split])
+        self.point_cloud_range = point_cloud_range or config.SPARSE_POINT_CLOUD_RANGE
+        self.voxel_size = voxel_size or config.SPARSE_VOXEL_SIZE
+        self.max_points_per_voxel = max_points_per_voxel or config.SPARSE_MAX_POINTS_PER_VOXEL
+        self.max_voxels = max_voxels or config.SPARSE_MAX_VOXELS
 
         if len(self.samples) == 0:
             raise RuntimeError(f"no frames found for split={split}")
@@ -123,8 +133,8 @@ class SonarDiverDataset(Dataset):
         points = points[~np.isnan(points).any(axis=1)]
 
         voxel_xyzr, coords, num_points = voxelize(
-            points, config.SPARSE_POINT_CLOUD_RANGE, config.SPARSE_VOXEL_SIZE,
-            config.SPARSE_MAX_POINTS_PER_VOXEL, config.SPARSE_MAX_VOXELS)
+            points, self.point_cloud_range, self.voxel_size,
+            self.max_points_per_voxel, self.max_voxels)
         voxel_features = augment_with_centroid_offset(voxel_xyzr, num_points)
         gt_boxes = _load_gt_boxes(sonar_path)
 

@@ -131,6 +131,70 @@ SPARSE_DOWN_SLOT_UP_SLOTFORMER_NUM_HEADS = 4
 # 걸렸던 것과 같은 비용 구조(decoder 얕은 단계가 거의 원본 해상도의 voxel 수를 처리)를
 # 그대로 가짐 -- 실제 학습 전에 반드시 실측(메모리/속도) 먼저 할 것.
 
+# experiments/exp2_down_slot_up_bev/voxelnet.py 전용 (2026-09-02, "지금 실험 토대로 구조 변경" 새 실험) -- 위
+# SPARSE_DOWN_SLOT_UP_* 백본은 그대로 재사용하되, 그 출력(sparse voxel)을 SparseCenterHead로
+# 바로 보내는 대신 dense (B,C,D,H,W)로 scatter한 뒤 z를 채널로 눌러 BEV로 만들고, RPNCenterHead
+# (dense 파이프라인의 원래 head, model.py -- 안 바꿈)로 보낸다. VOXEL_SIZE의 z를 0.5로 굵게
+# 잡은 이유가 바로 이것: SPARSE_POINT_CLOUD_RANGE의 z 범위(-5.6~5.6, 11.2m)에서 z=0.1이면
+# D=112라 4단계 다운+4단계 완전복원을 해도 D가 그대로 112로 남아 채널로 누르면 128*112=14336
+# 채널이 되어버림 -- z=0.5로 바꾸면 D=22로 시작해서, 채널 압축 자체는 여전히 크지만
+# (128*22=2816) 1x1 conv 하나로 RPN_IN_CHANNELS(128)까지 투영 가능한 수준.
+# x,y는 그대로 0.1 유지 -- z만 훨씬 굵게 잡는 게 정확히 원조 VoxelNet의 ConvMiddleLayers가
+# 하던 것(z만 빠르게 눌러서 채널로, x,y는 그대로 두고 2D RPN에서 처리)과 같은 철학.
+SPARSE_BEV_VOXEL_SIZE = (0.1, 0.1, 0.5)
+# 2026-09-02: scan_point_range.py로 labeling-tool-main/dataset 전체(37010 프레임, 2.52억
+# point) 스캔해서 실측 범위(x: 0.135~16.017, y: -11.331~11.306, z: -5.478~5.482)를 확인함 --
+# 기존 SPARSE_POINT_CLOUD_RANGE가 이미 이걸 여유있게 다 감싸고 있어 정확했음. x=0 근처
+# 빈 공간(0~0.135m)만큼 살짝 자르는 것도 검토했으나, 그건 dense grid(모든 셀이 항상
+# 계산 비용을 먹음)에서나 의미 있는 최적화 -- sparse는 비어있는 셀이 애초에 비용이
+# 거의 없으므로 굳이 좁힐 이유가 없음. 그대로 SPARSE_POINT_CLOUD_RANGE 재사용.
+SPARSE_BEV_POINT_CLOUD_RANGE = SPARSE_POINT_CLOUD_RANGE  # unchanged -- only VOXEL_SIZE differs from the sparse_voxelnet.py experiment (fully-sparse head, not part of the experiments/ BEV series)
+SPARSE_BEV_GRID_SIZE = tuple(round((SPARSE_BEV_POINT_CLOUD_RANGE[3 + i] - SPARSE_BEV_POINT_CLOUD_RANGE[i]) / SPARSE_BEV_VOXEL_SIZE[i])
+                              for i in range(3))  # (W',H',D')=(x,y,z) -- (162,228,22) at this voxel size
+SPARSE_BEV_MAX_POINTS_PER_VOXEL = 35
+SPARSE_BEV_MAX_VOXELS = 40000
+
+# Same 4-stage backbone shape as SPARSE_DOWN_SLOT_UP_* above, reused verbatim for this
+# experiment too (only VOXEL_SIZE/head/data-split differ) -- UPSAMPLE_STAGES=4 (full
+# restore) means the backbone's output D equals the *input* D (22 at this voxel size),
+# not the deepest-bottleneck D -- see experiments/exp2_down_slot_up_bev/voxelnet.py for
+# the exact grid-size bookkeeping (computed once at construction, not re-derived from
+# data each forward).
+SPARSE_BEV_STAGE_CHANNELS = (64, 96, 128, 128)
+SPARSE_BEV_NUM_BLOCKS_PER_STAGE = 2
+SPARSE_BEV_DOWNSAMPLE_KERNEL = 3
+SPARSE_BEV_DOWNSAMPLE_STRIDE = 2
+SPARSE_BEV_UPSAMPLE_STAGES = 4
+SPARSE_BEV_DECODER_BLOCKS_PER_STAGE = 2
+SPARSE_BEV_SLOTFORMER_WIN_SIZE = 3    # x,y voxel size (0.1) and backbone depth/stride are identical
+                                       # to SPARSE_DOWN_SLOT_UP_*, so the bottleneck's x,y effective
+                                       # resolution is the same 1.6m/voxel (0.1*2^4) -- reuses that
+                                       # experiment's WIN_SIZE=3 derivation unchanged (only z/VOXEL_SIZE
+                                       # and what happens after the backbone differ between the two).
+SPARSE_BEV_SLOTFORMER_NUM_CYCLES = 2  # 6L, matching the current experiment this is based on
+SPARSE_BEV_SLOTFORMER_NUM_HEADS = 4
+
+# experiments/exp3_zdown_bev/voxelnet.py 전용 (2026-09-02) -- x,y는 전혀 안 건드리고 z만 sparse
+# conv로 stride 줘서 줄인 뒤(SparseConv3dDown(stride=(2,1,1)), coords가 [batch,z,y,x] 순서라
+# stride의 첫 값이 z), 그 결과를 dense (B,C,D,H,W)로 scatter+reshape해서 BEV를 만든다.
+# 원조 VoxelNet의 ConvMiddleLayers(z만 3번 다운샘플, x,y는 그대로 두고 2D RPN에 맡김)와
+# 정확히 같은 설계 철학을 sparse 버전으로 구현한 것 -- exp1_single_stage_bev/exp2_down_slot_up_bev는
+# 둘 다 x,y까지 같이 다운샘플하는 등방 backbone을 쓴 뒤 BEV로 누르는 거라 이거와 다르다(x,y
+# 해상도가 backbone 단계에서 전혀 안 줄어드는 게 이 실험만의 특징).
+# STAGE_CHANNELS 4단계, 매 단계 stride=(2,1,1) 대칭 padding=1 -- D: 22->11->6->3->2.
+SPARSE_BEV_ZDOWN_STAGE_CHANNELS = (64, 96, 128, 128)
+SPARSE_BEV_ZDOWN_NUM_BLOCKS_PER_STAGE = 1  # 가볍게 -- x,y가 안 줄어서 매 단계 voxel 수가
+                                            # 등방 backbone보다 훨씬 많이 남아있음(z만 줄어듦)
+SPARSE_BEV_ZDOWN_DOWNSAMPLE_KERNEL = 3
+# SlotFormer는 이 backbone의 최종(z만 줄어든) 출력에서 돌린다 -- x,y가 한 번도 안 줄어서
+# 유효 해상도가 원래 VOXEL_SIZE(0.1)m/voxel 그대로다. 물리적 윈도우 ~4.8m 기준
+# WIN_SIZE=4.8/0.1=48. 다만 x,y가 fine한 채로 남아있어 active voxel 수가 등방 backbone
+# 버전들보다 훨씬 많을 수 있음 -- 실측 전엔 비용을 장담 못 함(이게 이 실험의 핵심 질문).
+SPARSE_BEV_ZDOWN_SLOTFORMER_ENABLED = True
+SPARSE_BEV_ZDOWN_SLOTFORMER_WIN_SIZE = 48
+SPARSE_BEV_ZDOWN_SLOTFORMER_NUM_CYCLES = 2  # 6L ("2cycle")
+SPARSE_BEV_ZDOWN_SLOTFORMER_NUM_HEADS = 4
+
 # --- 학습 ---
 BATCH_SIZE = 4
 NUM_EPOCHS = 30

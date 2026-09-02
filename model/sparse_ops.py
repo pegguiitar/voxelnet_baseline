@@ -42,6 +42,29 @@ CONV_MODE = "vectorized"  # "vectorized" or "loop" -- measured on a real GPU (RT
                           # (~48ms/frame) despite <0.1% voxel occupancy.)
 
 
+def scatter_to_bev(features: torch.Tensor, coords: torch.Tensor, grid_size, batch_size: int,
+                    channels: int) -> torch.Tensor:
+    """Scatter a sparse (N,C) tensor to dense (B,C,D,H,W) via coords, then merge z
+    into the channel dim -> (B,C*D,H,W). The one shared implementation of the
+    "collapse a sparse backbone's output into a BEV feature map" step every
+    sparse_bev_*.py experiment backbone does at the end of its forward -- lets
+    each backbone return a ready-to-use dense BEV tensor directly instead of the
+    caller having to scatter/reshape sparse tensors itself."""
+    D, H, W = grid_size
+    dense = features.new_zeros(batch_size, channels, D, H, W)
+    if coords.shape[0] > 0:
+        b, z, y, x = coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
+        dense[b, :, z, y, x] = features
+    return dense.reshape(batch_size, channels * D, H, W)
+
+
+def _as_axis_tuple(v):
+    """int -> (v,v,v); already-a-3-tuple -> unchanged. Lets stride/padding be given
+    either isotropically (old call sites, unchanged behavior) or per-axis (e.g.
+    stride=(2,1,1) for a z-only downsample, matching coords' column order)."""
+    return tuple(v) if isinstance(v, (tuple, list)) else (v, v, v)
+
+
 def _sparse_conv_core(in_features, in_coords, in_index_grid, in_grid_size, out_coords,
                        weight, bias, stride, padding, dilation=1):
     if CONV_MODE == "loop":
@@ -56,12 +79,14 @@ def _sparse_conv_core_loop(in_features, in_coords, in_index_grid, in_grid_size, 
     Cout = weight.shape[-2]
     out = torch.zeros(Nout, Cout, device=in_features.device, dtype=in_features.dtype)
     X, Y, Z = in_grid_size
+    s0, s1, s2 = _as_axis_tuple(stride)
+    p0, p1, p2 = _as_axis_tuple(padding)
     for kx in range(k):
         for ky in range(k):
             for kz in range(k):
-                ix = out_coords[:, 1] * stride + kx * dilation - padding
-                iy = out_coords[:, 2] * stride + ky * dilation - padding
-                iz = out_coords[:, 3] * stride + kz * dilation - padding
+                ix = out_coords[:, 1] * s0 + kx * dilation - p0
+                iy = out_coords[:, 2] * s1 + ky * dilation - p1
+                iz = out_coords[:, 3] * s2 + kz * dilation - p2
                 in_bounds = (ix >= 0) & (ix < X) & (iy >= 0) & (iy < Y) & (iz >= 0) & (iz < Z)
                 if not in_bounds.any():
                     continue
@@ -97,10 +122,12 @@ def _sparse_conv_core_vectorized(in_features, in_coords, in_index_grid, in_grid_
     offsets = torch.stack(torch.meshgrid(ar, ar, ar, indexing="ij"), dim=-1).reshape(-1, 3) * dilation  # (K,3)
     K = offsets.shape[0]
     X, Y, Z = in_grid_size
+    s0, s1, s2 = _as_axis_tuple(stride)
+    p0, p1, p2 = _as_axis_tuple(padding)
 
-    ix = out_coords[None, :, 1] * stride + offsets[:, 0:1] - padding  # (K,Nout)
-    iy = out_coords[None, :, 2] * stride + offsets[:, 1:2] - padding
-    iz = out_coords[None, :, 3] * stride + offsets[:, 2:3] - padding
+    ix = out_coords[None, :, 1] * s0 + offsets[:, 0:1] - p0  # (K,Nout)
+    iy = out_coords[None, :, 2] * s1 + offsets[:, 1:2] - p1
+    iz = out_coords[None, :, 3] * s2 + offsets[:, 2:3] - p2
     ib = out_coords[None, :, 0].expand(K, Nout)
 
     in_bounds = (ix >= 0) & (ix < X) & (iy >= 0) & (iy < Y) & (iz >= 0) & (iz < Z)
@@ -147,7 +174,13 @@ class SubMConv3d(nn.Module):
 
 
 class SparseConv3dDown(nn.Module):
-    """Strided conv that can shrink the active set (used for the stem downsample)."""
+    """Strided conv that can shrink the active set (used for the stem downsample).
+
+    stride/padding: either a single int (isotropic, same value for all 3 coord
+    columns -- the original behavior) or a 3-tuple, one value per coords column
+    (column order must match whatever convention the caller's coords use -- e.g.
+    this repo's [batch,z_idx,y_idx,x_idx] means stride[0] applies to z, stride[1] to
+    y, stride[2] to x). A z-only downsample (x,y untouched) is stride=(2,1,1)."""
 
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=True):
         super().__init__()
@@ -156,12 +189,14 @@ class SparseConv3dDown(nn.Module):
         nn.init.kaiming_uniform_(self.weight.reshape(-1, in_channels), a=5 ** 0.5)
         self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
         self.k = k
-        self.stride = stride
-        self.padding = padding
+        self.stride = _as_axis_tuple(stride)
+        self.padding = _as_axis_tuple(padding)
 
     @staticmethod
     def output_grid_size(grid_size, kernel_size, stride, padding):
-        return tuple((g + 2 * padding - kernel_size) // stride + 1 for g in grid_size)
+        stride = _as_axis_tuple(stride)
+        padding = _as_axis_tuple(padding)
+        return tuple((g + 2 * padding[i] - kernel_size) // stride[i] + 1 for i, g in enumerate(grid_size))
 
     def forward(self, features, coords, index_grid, grid_size, batch_size):
         out_grid_size = self.output_grid_size(grid_size, self.k, self.stride, self.padding)
@@ -175,30 +210,50 @@ class SparseConv3dDown(nn.Module):
         # <0.1% voxel occupancy; this arithmetic is cheap enough that batching it costs nothing
         # extra on CPU either.
         k = self.k
+        s0, s1, s2 = self.stride
+        p0, p1, p2 = self.padding
         if coords.shape[0] == 0:
             out_coords = torch.zeros((0, 4), dtype=torch.long, device=device)
         else:
+            # For an axis with stride==1 (e.g. x,y in a z-only downsample), every
+            # kernel offset maps to a DIFFERENT output coordinate (out = in - koff +
+            # padding), so looping over the full k offsets there -- as the isotropic
+            # case correctly does when every axis is actually being strided -- would
+            # instead "dilate" the active set outward by up to k//2 voxels on that
+            # axis EVERY stage, even though nothing is being downsampled there. Left
+            # unchecked this compounds across stages (measured: 800 synthetic input
+            # voxels -> CUDA OOM by the 4th stage). Using only the center tap
+            # (koff=padding, giving out=in exactly) for stride==1 axes keeps output
+            # support on that axis IDENTICAL to input support -- true submanifold
+            # behavior on the non-strided axes, matching SubMConv3d -- while the
+            # actual gather in _sparse_conv_core still uses the full k^3 kernel
+            # window regardless of how out_coords was built, so the conv's
+            # receptive field in x,y is unaffected; only which positions get
+            # computed changes. No-op for the isotropic (all-axes-strided) case.
             ar = torch.arange(k, device=device)
-            offsets = torch.stack(torch.meshgrid(ar, ar, ar, indexing="ij"), dim=-1).reshape(-1, 3)  # (K,3)
+            off0 = ar if s0 != 1 else torch.tensor([p0], device=device)
+            off1 = ar if s1 != 1 else torch.tensor([p1], device=device)
+            off2 = ar if s2 != 1 else torch.tensor([p2], device=device)
+            offsets = torch.stack(torch.meshgrid(off0, off1, off2, indexing="ij"), dim=-1).reshape(-1, 3)  # (K,3)
 
-            numer_x = coords[None, :, 1] - offsets[:, 0:1] + self.padding  # (K,N)
-            numer_y = coords[None, :, 2] - offsets[:, 1:2] + self.padding
-            numer_z = coords[None, :, 3] - offsets[:, 2:3] + self.padding
-            div = (numer_x % self.stride == 0) & (numer_y % self.stride == 0) & (numer_z % self.stride == 0)
+            numer_0 = coords[None, :, 1] - offsets[:, 0:1] + p0  # (K,N)
+            numer_1 = coords[None, :, 2] - offsets[:, 1:2] + p1
+            numer_2 = coords[None, :, 3] - offsets[:, 2:3] + p2
+            div = (numer_0 % s0 == 0) & (numer_1 % s1 == 0) & (numer_2 % s2 == 0)
 
-            ox = numer_x // self.stride
-            oy = numer_y // self.stride
-            oz = numer_z // self.stride
-            ob = coords[None, :, 0].expand_as(ox)
+            o0 = numer_0 // s0
+            o1 = numer_1 // s1
+            o2 = numer_2 // s2
+            ob = coords[None, :, 0].expand_as(o0)
 
             in_range = (
-                (ox >= 0) & (ox < out_grid_size[0]) &
-                (oy >= 0) & (oy < out_grid_size[1]) &
-                (oz >= 0) & (oz < out_grid_size[2])
+                (o0 >= 0) & (o0 < out_grid_size[0]) &
+                (o1 >= 0) & (o1 < out_grid_size[1]) &
+                (o2 >= 0) & (o2 < out_grid_size[2])
             )
             valid = (div & in_range).reshape(-1)
 
-            cand = torch.stack([ob, ox, oy, oz], dim=-1).reshape(-1, 4)[valid]
+            cand = torch.stack([ob, o0, o1, o2], dim=-1).reshape(-1, 4)[valid]
             out_coords = torch.zeros((0, 4), dtype=torch.long, device=device) if cand.shape[0] == 0 \
                 else torch.unique(cand, dim=0)
 
