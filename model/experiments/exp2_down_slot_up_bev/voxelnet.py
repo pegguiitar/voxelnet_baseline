@@ -78,7 +78,8 @@ class SparseBEVDownSlotUpVoxelNet(nn.Module):
             f"takes D={Dp} to {D_out}, not 1 -- adjust the stage count in config.py."
         )
         self.zdown = ZDownTo2D(self.encoder.out_channels, zdown_channels, kernel_size=zdown_kernel,
-                                indice_key_prefix="exp2_zdown")
+                                indice_key_prefix="exp2_zdown",
+                                num_refine_blocks=config.SPARSE_FULLY_ZDOWN_NUM_REFINE_BLOCKS)
 
         self.head = SparseBEVCenterHead(self.zdown.out_channels)
 

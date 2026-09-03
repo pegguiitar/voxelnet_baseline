@@ -48,7 +48,8 @@ class SparseBEVSingleStageVoxelNet(nn.Module):
             f"SPARSE_FULLY_ZDOWN_STAGE_CHANNELS has {len(stage_channels)} stages, which "
             f"takes D={Dp} to {D_out}, not 1 -- adjust the stage count in config.py."
         )
-        self.zdown = ZDownTo2D(128, stage_channels, kernel_size=kernel, indice_key_prefix="exp1_zdown")
+        self.zdown = ZDownTo2D(128, stage_channels, kernel_size=kernel, indice_key_prefix="exp1_zdown",
+                                num_refine_blocks=config.SPARSE_FULLY_ZDOWN_NUM_REFINE_BLOCKS)
 
         self.slotformer = SlotFormerBackbone(
             self.zdown.out_channels, config.SPARSE_FULLY_SLOTFORMER_WIN_SIZE,

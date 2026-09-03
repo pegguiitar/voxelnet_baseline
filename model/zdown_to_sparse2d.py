@@ -16,25 +16,37 @@ synthetic voxels to 10000+ before applying sparse_ops.restrict_xy_support after
 each stage; with it, growth stays bounded (some growth from z-kernel overlap, then
 shrinks back down as D keeps shrinking) and lands on exactly the original
 unique-(y,x) count once D==1 -- see that function's docstring for the full story.
+
+2026-09-03: added `num_refine_blocks` SparseBasicBlock(s) (backbone3d.py's -- two
+SubMConv3d + BN + ReLU + residual, active-set-preserving) after each stage's
+restrict_xy_support, same down-then-refine pattern backbone3d.Sparse3DStage already
+uses -- exp1/exp3 had no refinement at all before this (just the raw strided
+conv), unlike exp2's encoder (Sparse3DStage + residual blocks every stage).
 """
 import torch
 import torch.nn as nn
 import spconv.pytorch as spconv
 
 from sparse_ops import yx_key, restrict_xy_support
+from backbone3d import SparseBasicBlock
 
 
 class ZDownTo2D(nn.Module):
-    def __init__(self, in_channels, stage_channels, kernel_size=3, indice_key_prefix="zdown2d"):
+    def __init__(self, in_channels, stage_channels, kernel_size=3, indice_key_prefix="zdown2d",
+                 num_refine_blocks=1):
         super().__init__()
         self.convs = nn.ModuleList()
         self.bns = nn.ModuleList()
+        self.refine_blocks = nn.ModuleList()
         c_in = in_channels
         for i, c_out in enumerate(stage_channels):
             self.convs.append(spconv.SparseConv3d(c_in, c_out, kernel_size=kernel_size,
                                                     stride=(2, 1, 1), padding=(1, 1, 1),
                                                     bias=False, indice_key=f"{indice_key_prefix}_{i}"))
             self.bns.append(nn.BatchNorm1d(c_out))
+            self.refine_blocks.append(nn.ModuleList([
+                SparseBasicBlock(c_out, kernel_size=kernel_size) for _ in range(num_refine_blocks)
+            ]))
             c_in = c_out
         self.relu = nn.ReLU(inplace=True)
         self.out_channels = c_in
@@ -58,10 +70,12 @@ class ZDownTo2D(nn.Module):
         H, W = x.spatial_shape[1], x.spatial_shape[2]
         allowed_keys = torch.unique(yx_key(x.indices, H, W))
 
-        for conv, bn in zip(self.convs, self.bns):
+        for conv, bn, blocks in zip(self.convs, self.bns, self.refine_blocks):
             x = conv(x)
             x = x.replace_feature(self.relu(bn(x.features)))
             x = restrict_xy_support(x, allowed_keys, H, W)
+            for block in blocks:
+                x = block(x)
 
         D_final = x.spatial_shape[0]
         assert D_final == 1, (

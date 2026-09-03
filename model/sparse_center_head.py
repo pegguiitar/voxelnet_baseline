@@ -165,6 +165,10 @@ def build_sparse_targets(gt_boxes_list: list, coords: torch.Tensor, stride: int,
             pos_row = sample_idx[nearest_local]
 
             reg_mask[pos_row] = True
+            heatmap[pos_row, 0] = 1.0  # force exact 1.0 at the assigned voxel -- gaussian_focal_loss's
+            # pos_mask = (target == 1) needs this exactly; the distance-based gauss above almost never
+            # lands on exactly 1.0 (the true GT center rarely coincides with an active voxel), so without
+            # this the assigned positive was never recognized as positive at all (see incident notes).
             offset_t[pos_row] = target_cell - sample_xyz_idx[nearest_local]
             dim_t[pos_row] = torch.tensor([math.log(l), math.log(w), math.log(h)], device=device)
             rot_t[pos_row] = six

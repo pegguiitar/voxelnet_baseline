@@ -196,6 +196,10 @@ SPARSE_BEV_CONVMID_CHANNELS = 64  # ConvMiddleLayers의 고정 채널 폭과 동
 # 5단계만에 1로 떨어짐, SPARSE_BEV_GRID_SIZE의 D'=22 기준 계산됨).
 SPARSE_FULLY_ZDOWN_STAGE_CHANNELS = (64, 80, 96, 112, 128)
 SPARSE_FULLY_ZDOWN_DOWNSAMPLE_KERNEL = 3
+# 매 z압축 stage 뒤에 붙는 SparseBasicBlock(SubMConv3d 2개+잔차, active set 불변) 개수 --
+# exp2 encoder(backbone3d.Sparse3DStage)와 같은 "다운샘플 후 정제" 패턴을 zdown에도 적용,
+# 개수도 exp2와 동일하게 맞춤 (= SPARSE_BEV_NUM_BLOCKS_PER_STAGE).
+SPARSE_FULLY_ZDOWN_NUM_REFINE_BLOCKS = SPARSE_BEV_NUM_BLOCKS_PER_STAGE
 
 # 2D sparse backbone -- dense RPNBackbone(model.py)과 똑같은 채널/레이어 수를 그대로 재사용
 # (block1/2/3 다운샘플 + deconv-concat neck) -- "2D 부분을 sparse로 바꾸면 어떻게 되는가"만
