@@ -3,12 +3,10 @@
 Uses the scene-level 3-way split (TRAIN_SCENES/VAL_SCENES/TEST_SCENES,
 sonar_diver_dataset.py) -- val is held out at the scene level, same as test.
 
-Density aux-head supervision is skipped (points=None passed to build_bev_targets)
--- sonar_diver_dataset.py's collate_fn doesn't currently expose raw
-pre-voxelization points, only the (M,13) gt_boxes tensor. The density_head still
-runs (near-zero extra cost, matches RPNCenterHead's design -- see model.py), just
-isn't supervised; add a "points" field to __getitem__/collate_fn if this aux loss
-turns out to matter.
+Unlike exp1/2/3's PREVIOUS (dense-BEV-head) design, this model's forward() returns
+a (pred_dict, coords, batch_size) sparse triple, not a dense 6-tuple -- targets/
+loss/decode come from sparse_head_bev.py, and per-epoch val AP from
+eval_sparse_bev.py, not sparse_bev_head.py/eval_bev.py.
 
 Usage:
     python train.py --ckpt_dir checkpoints_exp1_single_stage_bev
@@ -22,21 +20,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # -> voxelnet_baseline/model
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import config
 from sonar_diver_dataset import SonarDiverDataset, collate_fn
-from sparse_bev_head import build_bev_targets, decode_bev_center_boxes
-from center_loss import center_voxelnet_loss
-from eval_bev import evaluate_bev_ap, IOU_THRESHOLDS as VAL_AP_IOU_THRESHOLDS, PRINT_IOUS as VAL_AP_PRINT_IOUS
+from sparse_head_bev import build_sparse_bev_targets, sparse_bev_center_loss
+from eval_sparse_bev import evaluate_sparse_bev_ap, IOU_THRESHOLDS as VAL_AP_IOU_THRESHOLDS, \
+    PRINT_IOUS as VAL_AP_PRINT_IOUS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from voxelnet import SparseBEVSingleStageVoxelNet  # noqa: E402
 
-LOSS_KEYS = ["hm_loss", "reg_loss", "offset_loss", "z_loss", "dim_loss", "rot_loss", "density_loss"]
+LOSS_KEYS = ["hm_loss", "reg_loss", "offset_loss", "z_loss", "dim_loss", "rot_loss"]
 AP_KEYS = []  # ap_iou25, precision_iou25, recall_iou25, ap_iou30, ... (matches
 for _t in VAL_AP_IOU_THRESHOLDS:  # model/train.py's own per-epoch val metric set, VAL_LOG_IOUS)
     _tag = int(round(_t * 100))
@@ -83,22 +80,10 @@ def run_step(model, batch, device):
     coords = batch["coords"].to(device, non_blocking=True)
     gt_boxes_list = batch["gt_boxes"]  # list[B] of (M_b,13) CPU tensors -- targets built on CPU (numpy)
 
-    heatmap, offset, z, dim, rot, density = model(voxel_features, num_points, coords)
-
-    targets = [build_bev_targets(gb.numpy(), None, model.head_grid_size, model.head_stride, model.pc_range)
-               for gb in gt_boxes_list]
-    heatmap_t = torch.from_numpy(np.stack([t["heatmap"][0] for t in targets])).unsqueeze(1).to(device)
-    reg_mask_t = torch.from_numpy(np.stack([t["reg_mask"] for t in targets])).to(device)
-    offset_t = torch.from_numpy(np.stack([t["offset"] for t in targets])).to(device)
-    z_t = torch.from_numpy(np.stack([t["z"] for t in targets])).to(device)
-    dim_t = torch.from_numpy(np.stack([t["dim"] for t in targets])).to(device)
-    rot_t = torch.from_numpy(np.stack([t["rot"] for t in targets])).to(device)
-
-    loss, stats = center_voxelnet_loss(
-        heatmap, offset, z, dim, rot,
-        heatmap_t, reg_mask_t, offset_t, z_t, dim_t, rot_t,
-    )
-    return loss, stats, (heatmap, offset, z, dim, rot, density)
+    pred, out_coords, batch_size = model(voxel_features, num_points, coords)
+    target = build_sparse_bev_targets(gt_boxes_list, out_coords, model.head_stride, model.pc_range)
+    loss, stats = sparse_bev_center_loss(pred, target)
+    return loss, stats, pred
 
 
 @torch.no_grad()
@@ -158,8 +143,8 @@ def main():
 
     model = SparseBEVSingleStageVoxelNet().to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"params: {n_params:,}  out_grid_size(D,H,W): {model.out_grid_size}  "
-          f"head_grid_size(W'',H''): {model.head_grid_size}  head_stride: {model.head_stride}")
+    print(f"params: {n_params:,}  head_grid_size(W'',H''): {model.head_grid_size}  "
+          f"head_stride: {model.head_stride}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     steps_per_epoch = len(train_loader)
@@ -216,14 +201,12 @@ def main():
         metrics_by_thresh = None
         if args.val_ap_every_n_epochs and (epoch + 1) % args.val_ap_every_n_epochs == 0:
             max_frames = None if not args.val_ap_max_frames else args.val_ap_max_frames
-            metrics_by_thresh, ap_time = evaluate_bev_ap(
+            metrics_by_thresh, ap_time = evaluate_sparse_bev_ap(
                 model, val_loader, device, score_thresh=args.val_ap_score_thresh, max_frames=max_frames)
 
         logger.log("val", epoch, global_step, "", val_loss, val_stats, metrics_by_thresh=metrics_by_thresh)
         msg = f"epoch {epoch}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} time={epoch_time:.1f}s"
         if metrics_by_thresh is not None:
-            # stdout stays terse (PRINT_IOUS subset, AP only); the full IOU_THRESHOLDS
-            # set (AP+precision+recall each) still goes to the CSV via logger.log above.
             ap_str = "  ".join(f"AP@{t:.2f}={metrics_by_thresh[t][0]:.4f}" for t in VAL_AP_PRINT_IOUS)
             msg += f"  ({ap_time:.1f}s) {ap_str}"
         print(msg)

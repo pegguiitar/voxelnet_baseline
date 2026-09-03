@@ -1,37 +1,24 @@
-"""exp2_down_slot_up_bev - N-stage sparse down-sample encoder -> SlotFormer at the
-bottleneck -> M-stage up-sample decoder (backbone3d_down_slot_up.SparseDownSlotUpBackbone,
-unchanged), replacing the old sparse_bev_voxelnet.py.
+"""exp2_down_slot_up_bev - U-Net-style: an isotropic 3D encoder (x,y,z downsampled
+together, backbone3d.Sparse3DBackbone) reaches a bottleneck, z is compressed the
+rest of the way to D=1 there (zdown_to_sparse2d.ZDownTo2D -- cheap since x,y is
+already small at the bottleneck), SlotFormer windowed attention (2-axis, same as
+exp1) runs on that bottleneck's sparse 2D features, and then a genuinely-2D U-Net
+(backbone2d_sparse.Sparse2DBackbone, its own self-contained down+up structure)
+brings x,y back up to a more usable resolution before the head. The only one of
+this experiments/ family whose backbone actually changes x,y resolution.
 
-Same "backbone outputs BEV directly" shape as exp1/exp3 in this experiments/
-folder: DownSlotUpBEVBackbone.forward returns a dense (B,C*D,H,W) feature map
-directly (scatter-to-dense + z-into-channels merge happens inside the backbone,
-via sparse_ops.scatter_to_bev) instead of the outer VoxelNet class doing that.
-
-Why this needs its own VOXEL_SIZE (config.SPARSE_BEV_VOXEL_SIZE, z=0.5 instead of
-sparse_voxelnet.py's z=0.1): collapsing z into channels means whatever D (z-bin
-count) survives to the point of collapse multiplies directly into the channel count
-fed to the projection conv -- at z=0.1 the sonar range's ~11.2m z-extent gives
-D~112, so collapsing that would need a 128*112=14336-channel projection input.
-z=0.5 keeps D~22; the decoder restores back to the INPUT D exactly (a structural
-property of SparseDownSlotUpBackbone's decoder, not re-derived from data), so the
-channel count fed to the projection conv is backbone.out_channels * 22 -- large but
-tractable for a single 1x1 conv. x,y stay at 0.1m (unchanged from sparse_voxelnet.py)
--- only z is coarsened, mirroring the original VoxelNet's own asymmetry (aggressive
-z reduction via ConvMiddleLayers, x/y handled entirely by the 2D RPNBackbone
-afterward), just achieved here by choosing VOXEL_SIZE instead of an anisotropic
-conv stride (this backbone's down-conv always uses the same stride for x/y/z
-every stage).
-
-2026-09-03: backbone3d_down_slot_up.SparseDownSlotUpBackbone (imported below)
-migrated to spconv -- see that module's docstring and
-exp3_conv_middle_bev/voxelnet.py's for why (the from-scratch sparse_ops.py
-backward pass was the real bottleneck, ~80% of total step time, not backbone
-depth/SlotFormer). Its (features, coords, grid_size) tuple interface is
-unchanged, just no more index_grid argument (spconv manages its own internal
-indices via indice_key rulebooks, so build_index_grid is gone too).
-scatter_to_bev is still used unchanged here -- profiling found it was never
-the bottleneck (its backward is a plain gather over unique indices, not the
-duplicate-index scatter-add pattern that was actually slow).
+2026-09-03: this experiment's THIRD design. Originally backbone3d_down_slot_up.
+SparseDownSlotUpBackbone (N-stage down, SlotFormer at the bottleneck, M-stage up
+restoring x,y AND z together via paired inverse convs) + dense scatter for
+RPNCenterHead. The intent going into this redesign was "encoder downsamples x,y,z
+together, decoder upsamples x,y only" -- but spconv.SparseInverseConv3d can only
+invert a conv call that used the EXACT SAME (kernel,stride,padding) it's paired
+with via indice_key, so a decoder that restores only 2 of the 3 axes an isotropic
+encoder touched isn't directly expressible. This design gets the same practical
+effect a different way: finish compressing z to 1 at the bottleneck (where it's
+cheap), then hand off to a backbone that is *only* 2D from there on -- "the decoder
+only ever touches x,y" becomes true by construction, since there's no z axis left
+for it to touch.
 """
 import sys
 from pathlib import Path
@@ -40,59 +27,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # -> vox
 
 import torch
 import torch.nn as nn
+import spconv.pytorch as spconv
 
 import config
-from model import StackedVFE, RPNCenterHead
-from backbone3d_down_slot_up import SparseDownSlotUpBackbone
-from sparse_ops import scatter_to_bev
+from model import StackedVFE
+from backbone3d import Sparse3DBackbone
+from zdown_to_sparse2d import ZDownTo2D
+from backbone2d_sparse import Sparse2DBackbone
+from slotformer import SlotFormerBackbone
+from sparse_head_bev import SparseBEVCenterHead
 
 
-def _stage_grid_sizes(grid_size, num_stages, kernel, stride):
-    """[grid_size, size after stage 1, ..., size after stage num_stages] --
-    deterministic from config alone (pure conv-arithmetic, independent of which
-    backend actually computes the convolution)."""
-    padding = kernel // 2
-
-    def out(g):
-        return (g + 2 * padding - kernel) // stride + 1
-
-    sizes = [tuple(grid_size)]
-    for _ in range(num_stages):
-        sizes.append(tuple(out(g) for g in sizes[-1]))
-    return sizes
-
-
-class DownSlotUpBEVBackbone(nn.Module):
-    """SparseDownSlotUpBackbone (N-stage down, SlotFormer at the bottleneck,
-    M-stage up -- SlotFormer already lives inside this backbone, unlike exp1's
-    external one), then scatter-to-dense + z-into-channels merge. Outputs a dense
-    BEV feature map directly."""
-
-    def __init__(self, in_channels, stage_channels, num_blocks_per_stage, down_kernel, down_stride,
-                 upsample_stages, decoder_blocks_per_stage, slot_win_size, slot_num_cycles, slot_num_heads):
-        super().__init__()
-        self.backbone = SparseDownSlotUpBackbone(
-            in_channels=in_channels, stage_channels=stage_channels, num_blocks_per_stage=num_blocks_per_stage,
-            down_kernel=down_kernel, down_stride=down_stride, upsample_stages=upsample_stages,
-            decoder_blocks_per_stage=decoder_blocks_per_stage,
-            slot_win_size=slot_win_size, slot_num_cycles=slot_num_cycles, slot_num_heads=slot_num_heads,
-        )
-        self.out_channels = self.backbone.out_channels
-        self._num_stages = len(stage_channels)
-        self._kernel = down_kernel
-        self._stride = down_stride
-        self._upsample_stages = upsample_stages
-
-    def output_grid_size(self, grid_size):
-        # The decoder restores back to stage_sizes[n-m] exactly (SparseInverseConv3d
-        # writes to the cached parent coords of the stage it's inverting) -- a
-        # structural property of the decoder, not re-derived from data.
-        sizes = _stage_grid_sizes(grid_size, self._num_stages, self._kernel, self._stride)
-        return sizes[self._num_stages - self._upsample_stages]
-
-    def forward(self, voxelwise, coords, grid_size, batch_size):
-        x, c, gs = self.backbone(voxelwise, coords, grid_size, batch_size)
-        return scatter_to_bev(x, c, gs, batch_size, self.out_channels)
+def _stages_needed_for_d1(d_in: int, kernel_size: int = 3) -> int:
+    """How many ZDownTo2D stages (kernel/stride=2/padding=kernel//2 on z) it takes
+    to bring d_in down to exactly 1 -- computed at construction time so this model
+    can slice config.SPARSE_FULLY_ZDOWN_STAGE_CHANNELS (sized for exp1/exp3's
+    Dp=22 starting point) down to however many stages THIS model's smaller
+    bottleneck D actually needs."""
+    n, d = 0, d_in
+    while d != 1:
+        d = ZDownTo2D.output_d(d, 1, kernel_size)
+        n += 1
+        if n > 20:
+            raise ValueError(f"d_in={d_in} doesn't reach 1 in a reasonable number of stages")
+    return n
 
 
 class SparseBEVDownSlotUpVoxelNet(nn.Module):
@@ -105,51 +63,72 @@ class SparseBEVDownSlotUpVoxelNet(nn.Module):
         Wp, Hp, Dp = config.SPARSE_BEV_GRID_SIZE
         self.input_grid_size = (Dp, Hp, Wp)
 
-        self.backbone = DownSlotUpBEVBackbone(
+        self.encoder = Sparse3DBackbone(
             in_channels=128,  # StackedVFE's fixed output width
-            stage_channels=config.SPARSE_BEV_STAGE_CHANNELS,
-            num_blocks_per_stage=config.SPARSE_BEV_NUM_BLOCKS_PER_STAGE,
-            down_kernel=config.SPARSE_BEV_DOWNSAMPLE_KERNEL,
-            down_stride=config.SPARSE_BEV_DOWNSAMPLE_STRIDE,
-            upsample_stages=config.SPARSE_BEV_UPSAMPLE_STAGES,
-            decoder_blocks_per_stage=config.SPARSE_BEV_DECODER_BLOCKS_PER_STAGE,
-            slot_win_size=config.SPARSE_BEV_SLOTFORMER_WIN_SIZE,
-            slot_num_cycles=config.SPARSE_BEV_SLOTFORMER_NUM_CYCLES,
-            slot_num_heads=config.SPARSE_BEV_SLOTFORMER_NUM_HEADS,
+            stage_channels=config.SPARSE_FULLY_ENCODER_STAGE_CHANNELS,
+            num_blocks_per_stage=config.SPARSE_FULLY_ENCODER_NUM_BLOCKS_PER_STAGE,
+            down_kernel=config.SPARSE_FULLY_ENCODER_DOWNSAMPLE_KERNEL,
+            down_stride=config.SPARSE_FULLY_ENCODER_DOWNSAMPLE_STRIDE,
+        )
+        n_enc = len(config.SPARSE_FULLY_ENCODER_STAGE_CHANNELS)
+        k_enc, s_enc = config.SPARSE_FULLY_ENCODER_DOWNSAMPLE_KERNEL, config.SPARSE_FULLY_ENCODER_DOWNSAMPLE_STRIDE
+        pad_enc = k_enc // 2
+
+        def _iso_out(g):
+            for _ in range(n_enc):
+                g = (g + 2 * pad_enc - k_enc) // s_enc + 1
+            return g
+
+        D_bn, H_bn, W_bn = _iso_out(Dp), _iso_out(Hp), _iso_out(Wp)  # bottleneck grid size
+
+        zdown_kernel = config.SPARSE_FULLY_ZDOWN_DOWNSAMPLE_KERNEL
+        n_zdown = _stages_needed_for_d1(D_bn, zdown_kernel)
+        all_channels = list(config.SPARSE_FULLY_ZDOWN_STAGE_CHANNELS)
+        assert len(all_channels) >= n_zdown, (
+            f"bottleneck D={D_bn} needs {n_zdown} z-down stages, but "
+            f"SPARSE_FULLY_ZDOWN_STAGE_CHANNELS only has {len(all_channels)} entries."
+        )
+        zdown_channels = all_channels[-n_zdown:]  # reuse the tail (same final width, 128, as exp1/exp3)
+        self.zdown = ZDownTo2D(self.encoder.out_channels, zdown_channels, kernel_size=zdown_kernel,
+                                indice_key_prefix="exp2_zdown")
+        assert ZDownTo2D.output_d(D_bn, n_zdown, zdown_kernel) == 1  # sanity check on the slicing above
+
+        self.slotformer = SlotFormerBackbone(
+            self.zdown.out_channels, config.SPARSE_FULLY_SLOTFORMER_WIN_SIZE,
+            config.SPARSE_FULLY_SLOTFORMER_NUM_CYCLES, config.SPARSE_FULLY_SLOTFORMER_NUM_HEADS,
+            num_axes=2,
         )
 
-        self.out_grid_size = self.backbone.output_grid_size(self.input_grid_size)  # (D_out,H_out,W_out)
-        D_out, H_out, W_out = self.out_grid_size
+        self.backbone2d = Sparse2DBackbone(
+            in_channels=self.zdown.out_channels,
+            block_channels=config.SPARSE_FULLY_BLOCK_CHANNELS,
+            block_layers=config.SPARSE_FULLY_BLOCK_LAYERS,
+            upsample_channels=config.SPARSE_FULLY_UPSAMPLE_CHANNELS,
+        )
 
-        bev_channels = self.backbone.out_channels * D_out
-        self._project = bev_channels != config.RPN_IN_CHANNELS
-        if self._project:
-            self.bev_project = nn.Conv2d(bev_channels, config.RPN_IN_CHANNELS, kernel_size=1)
-            self.bev_bn = nn.BatchNorm2d(config.RPN_IN_CHANNELS)
-            self.bev_relu = nn.ReLU(inplace=True)
+        self.head = SparseBEVCenterHead(self.backbone2d.out_channels)
 
-        self.head = RPNCenterHead()  # unchanged dense pipeline head (model.py) -- 6-tuple output
-
-        # RPNBackbone's block1 (RPNBlock's first conv: kernel=3,stride=2,padding=1) sets the
-        # final output size -- out=(in+2*1-3)//2+1=(in-1)//2+1 (== ceil(in/2), NOT in//2 --
-        # those two only agree for EVEN in).
+        # Sparse2DBackbone shrinks its own input by 2x (its output lands on its
+        # block1's resolution -- see that module's docstring), on top of the isotropic
+        # encoder's own s_enc^n_enc shrink of x,y.
+        H_out, W_out = (H_bn - 1) // 2 + 1, (W_bn - 1) // 2 + 1
         sx, sy, _ = config.SPARSE_BEV_VOXEL_SIZE
-        self.head_grid_size = ((W_out - 1) // 2 + 1, (H_out - 1) // 2 + 1)  # (W'', H'')
-        self.head_stride = (sx * (W_out / self.head_grid_size[0]),
-                             sy * (H_out / self.head_grid_size[1]))  # meters/cell at head resolution
+        self.head_grid_size = (W_out, H_out)      # (W'',H'') naming convention shared with siblings
+        self.head_grid_size_hw = (H_out, W_out)   # (H'',W'') -- matches coords' [batch,y,x] order
+        self.head_stride = (sx * (Wp / W_out), sy * (Hp / H_out))  # meters/cell at head resolution
         self.pc_range = config.SPARSE_BEV_POINT_CLOUD_RANGE
 
     def forward(self, voxel_features: torch.Tensor, num_points: torch.Tensor, coords: torch.Tensor):
-        """Same collate_fn inputs as sparse_voxelnet.py/model.py's dense path.
-        Returns RPNCenterHead's raw 6-tuple (heatmap, offset, z, dim, rot, density),
-        each (B,C,H'',W'') -- pass straight to center_loss.center_voxelnet_loss with
-        targets built by sparse_bev_head.build_bev_targets(..., self.head_grid_size,
-        self.head_stride, self.pc_range)."""
-        voxelwise = self.vfe(voxel_features, num_points)  # (K_total,128)
+        voxelwise = self.vfe(voxel_features, num_points)
         batch_size = int(coords[:, 0].max().item()) + 1 if len(coords) else 1
 
-        feat2d = self.backbone(voxelwise, coords, self.input_grid_size, batch_size)
-        if self._project:
-            feat2d = self.bev_relu(self.bev_bn(self.bev_project(feat2d)))
+        enc_feat, enc_coords, enc_grid_size = self.encoder(voxelwise, coords, self.input_grid_size, batch_size)
+        x = spconv.SparseConvTensor(enc_feat, enc_coords.int(), spatial_shape=list(enc_grid_size),
+                                     batch_size=batch_size)
+        x2d = self.zdown(x)
+        feat = self.slotformer(x2d.features, x2d.indices)
 
-        return self.head(feat2d)
+        x2d = x2d.replace_feature(feat)
+        out_feat, out_coords = self.backbone2d(x2d)
+        pred = self.head(out_feat)
+        return pred, out_coords, batch_size

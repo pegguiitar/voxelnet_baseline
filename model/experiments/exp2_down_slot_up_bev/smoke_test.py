@@ -1,6 +1,6 @@
 """smoke_test.py (exp2_down_slot_up_bev) - synthetic-data structural test for
-SparseBEVDownSlotUpVoxelNet (model construction -> forward -> BEV target building
--> dense center_voxelnet_loss -> backward -> decode).
+SparseBEVDownSlotUpVoxelNet (model construction -> forward -> sparse BEV target
+building -> sparse center loss -> backward -> decode).
 
 Usage: python smoke_test.py
 """
@@ -14,8 +14,7 @@ import torch
 
 import config
 import rotation3d
-from center_loss import center_voxelnet_loss
-from sparse_bev_head import build_bev_targets, decode_bev_center_boxes
+from sparse_head_bev import build_sparse_bev_targets, sparse_bev_center_loss, decode_sparse_bev_boxes
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from voxelnet import SparseBEVDownSlotUpVoxelNet  # noqa: E402
@@ -43,7 +42,7 @@ def make_synthetic_batch(batch_size=2, n_voxels_per_sample=400, n_gt_per_sample=
     pc_range = config.SPARSE_BEV_POINT_CLOUD_RANGE
     lo = np.array(pc_range[:3])
     hi = np.array(pc_range[3:])
-    gt_boxes_per_sample, points_per_sample = [], []
+    gt_boxes_per_sample = []
     for _ in range(batch_size):
         rows = []
         for _ in range(n_gt_per_sample):
@@ -53,10 +52,9 @@ def make_synthetic_batch(batch_size=2, n_voxels_per_sample=400, n_gt_per_sample=
             R = rotation3d.euler_to_matrix(rx, ry, rz)
             six = rotation3d.matrix_to_6d(R)
             rows.append(np.concatenate([center, dims, [0.0], six]))
-        gt_boxes_per_sample.append(np.stack(rows).astype(np.float32))
-        points_per_sample.append((lo + np.random.rand(200, 3) * (hi - lo)).astype(np.float32))
+        gt_boxes_per_sample.append(torch.from_numpy(np.stack(rows).astype(np.float32)))
 
-    return voxel_features, num_points, coords, gt_boxes_per_sample, points_per_sample
+    return voxel_features, num_points, coords, gt_boxes_per_sample
 
 
 def main():
@@ -66,51 +64,32 @@ def main():
     model = SparseBEVDownSlotUpVoxelNet().to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"params: {n_params:,}  input_grid_size(D,H,W): {model.input_grid_size}  "
-          f"out_grid_size(D,H,W): {model.out_grid_size}  head_grid_size(W'',H''): {model.head_grid_size}  "
-          f"head_stride(sx,sy): {model.head_stride}")
+          f"head_grid_size(W'',H''): {model.head_grid_size}  head_stride(sx,sy): {model.head_stride}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     batch_size = 2
-    voxel_features, num_points, coords, gt_boxes_per_sample, points_per_sample = make_synthetic_batch(
+    voxel_features, num_points, coords, gt_boxes_per_sample = make_synthetic_batch(
         batch_size=batch_size, device=device)
     print(f"input active voxels (pre-backbone): {coords.shape[0]}")
 
-    heatmap, offset, z, dim, rot, density = model(voxel_features, num_points, coords)
-    print(f"pred[heatmap]: {tuple(heatmap.shape)}  pred[offset]: {tuple(offset.shape)}")
+    pred, out_coords, bs = model(voxel_features, num_points, coords)
+    print(f"active cells at head: {out_coords.shape[0]}  pred[heatmap]: {tuple(pred['heatmap'].shape)}")
 
-    targets = [build_bev_targets(gt_boxes_per_sample[b], points_per_sample[b],
-                                  model.head_grid_size, model.head_stride, model.pc_range)
-               for b in range(batch_size)]
-    heatmap_t = torch.from_numpy(np.stack([t["heatmap"][0] for t in targets])).unsqueeze(1).to(device)
-    reg_mask_t = torch.from_numpy(np.stack([t["reg_mask"] for t in targets])).to(device)
-    offset_t = torch.from_numpy(np.stack([t["offset"] for t in targets])).to(device)
-    z_t = torch.from_numpy(np.stack([t["z"] for t in targets])).to(device)
-    dim_t = torch.from_numpy(np.stack([t["dim"] for t in targets])).to(device)
-    rot_t = torch.from_numpy(np.stack([t["rot"] for t in targets])).to(device)
-    density_t = torch.from_numpy(np.stack([t["density"] for t in targets])).to(device)
-    n_pos = int(reg_mask_t.sum().item())
+    target = build_sparse_bev_targets(gt_boxes_per_sample, out_coords, model.head_stride, model.pc_range)
+    n_pos = int(target["reg_mask"].sum().item())
     print(f"n_pos assigned: {n_pos} / {batch_size * 2} GT boxes")
 
-    loss, stats = center_voxelnet_loss(
-        heatmap, offset, z, dim, rot,
-        heatmap_t, reg_mask_t, offset_t, z_t, dim_t, rot_t,
-        density_pred=density, density_target=density_t,
-    )
+    loss, stats = sparse_bev_center_loss(pred, target)
     assert torch.isfinite(loss), "loss is not finite"
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
     print(f"loss: {loss.item():.4f}  stats: {stats}")
 
-    for b in range(batch_size):
-        boxes = decode_bev_center_boxes(
-            torch.sigmoid(heatmap[b]).detach().cpu().numpy(),
-            offset[b].permute(1, 2, 0).detach().cpu().numpy(),
-            z[b].permute(1, 2, 0).detach().cpu().numpy(),
-            dim[b].permute(1, 2, 0).detach().cpu().numpy(),
-            rot[b].permute(1, 2, 0).detach().cpu().numpy(),
-            model.head_stride, model.pc_range, score_thresh=0.0,
-        )
+    boxes_per_sample = decode_sparse_bev_boxes(
+        pred, out_coords, model.head_stride, batch_size, model.head_grid_size_hw,
+        model.pc_range, score_thresh=0.0)
+    for b, boxes in enumerate(boxes_per_sample):
         print(f"  sample {b}: {len(boxes)} decoded boxes (score_thresh=0.0, pre-training so meaningless numerically)")
 
     print("\nOK -- exp2_down_slot_up_bev forward/target/loss/backward/decode all ran without error.")

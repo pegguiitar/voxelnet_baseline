@@ -48,43 +48,70 @@ fine 0.1m voxel size) is architecturally similar to the `3d-point-cloud` project
 `unet` branch, which measured 3+ hours/epoch even on an A100 -- time a handful of
 real steps before committing to a full run (see "Measuring before training" below).
 
-## BEV backbone experiments (`model/experiments/`)
+## Fully-sparse BEV experiments (`model/experiments/`)
 
-A second comparison series, alongside the fully-sparse-head experiment above. All
-three replace `SparseCenterHead` with `RPNCenterHead` (the original dense pipeline's
-head, unchanged) fed by a dense BEV feature map -- but they answer two DIFFERENT
-questions, so read the backbone column below rather than assuming all 3 are directly
-comparable to each other:
+**2026-09-03, second redesign.** The first BEV redesign (exp1/2/3 each ending in
+"scatter to dense `(B,C,H,W)` -> dense 2D `RPNBackbone`/`RPNCenterHead`") still paid
+full dense-grid cost for that entire 2D stage no matter how cheap the sparse
+encoder in front of it was -- the same waste `dense_baseline_bev`'s
+`ConvMiddleLayers`-alone comparison measured (dense ~0.74 it/s/7.9GB vs sparse
+~6.2 it/s/3.4GB) turned out to apply to the much bigger, shared 16-layer 2D
+backbone too. This redesign never materializes a dense tensor anywhere, closer to
+VoxelNeXt's (Chen et al., CVPR 2023) "stay sparse through the head" approach --
+adapted onto this codebase's own components (spconv, this repo's VFE/config/head
+conventions) rather than porting VoxelNeXt's exact architecture. All 3 share the
+same first step (`zdown_to_sparse2d.ZDownTo2D`: z-only-stride spconv.SparseConv3d
+down to D=1, so every surviving `(batch,y,x)` has at most one row and dropping z
+needs no merge, just a column drop -- see that module's docstring for why
+`sparse_ops.restrict_xy_support` is needed alongside it: spconv's `SparseConv3d`,
+unlike `SubMConv3d`, doesn't restrict a stride==1 axis to its input support on its
+own, so a naive z-only-stride stage "dilates" x,y outward every stage) and the same
+sparse head (`sparse_head_bev.SparseBEVCenterHead` -- `RPNCenterHead`'s head set as
+`nn.Linear` instead of `nn.Conv2d(...,kernel_size=1)`, same dimension-transform
+trick `sparse_center_head.py` uses for the fully-3D experiment above), then differ
+in exactly one thing each:
 
-- **exp1/exp2 ("which sparse backbone structure is best?")**: each wraps a whole
-  sparse 3D backbone (single-stage vs. 4-stage down/SlotFormer/up) so the backbone
-  itself scatters to dense + merges z into channels at the end
-  (`sparse_ops.scatter_to_bev`) and returns a ready BEV feature map. Same
-  `SPARSE_BEV_*` voxelization and the same collapse method across both, so the
-  comparison isolates backbone STRUCTURE alone.
-- **exp3 ("what if ONLY the dense pipeline's z-collapse step were sparse?")**: not a
-  backbone-structure swap at all -- `model.ConvMiddleLayers` (dense pipeline's own
-  3-layer z-collapse) is reproduced layer-for-layer (same channels, same per-layer
-  kernel/stride/padding) using `SparseConv3dDown` instead of `nn.Conv3d`. VFE and
-  `RPNCenterHead`/`RPNBackbone` are the exact same dense-pipeline code, and there's no
-  SlotFormer or extra backbone stages -- this isolates the effect of sparsity in that
-  one component alone, as close to an apples-to-apples dense-vs-sparse ablation as
-  this codebase gets.
+| folder | after z-compression | x,y ever downsampled? | idea |
+|---|---|---|---|
+| `exp3_conv_middle_bev` | straight to the head | no | minimal baseline, closest to VoxelNeXt's "stay sparse, predict directly" |
+| `exp1_single_stage_bev` | `slotformer.SlotFormerBackbone(num_axes=2)` (windowed attention, x,y only -- z is already gone) | no | "does adding attention alone help?" |
+| `exp2_down_slot_up_bev` | isotropic 3D encoder first (`backbone3d.Sparse3DBackbone`, x,y,z together) *then* z-compress the bottleneck, *then* `backbone2d_sparse.Sparse2DBackbone` (a self-contained sparse 2D U-Net, spconv `SparseConv2d`/`SparseInverseConv2d`) | **yes** | "does a real spatial (2D) backbone help beyond attention?" |
 
-Each experiment is self-contained (`voxelnet.py`/`train.py`/`smoke_test.py`, one
-`<Name>BEVBackbone` class + one `SparseBEV<Name>VoxelNet` class per file) but shares
-`config.py`, `sparse_ops.py`, `model.py`, `sparse_bev_head.py` from `model/` (the
-parent directory):
+(exp2's encoder->decoder split is a deliberate workaround, not the original
+"encoder downsamples x,y,z, decoder restores x,y only" idea verbatim:
+`spconv.SparseInverseConv2d`/`3d` can only invert a conv call that used the *exact
+same* kernel/stride/padding it's paired with via `indice_key`, so a decoder that
+undoes only 2 of an isotropic 3D encoder's 3 downsampled axes isn't directly
+expressible. Finishing z-compression at the bottleneck first, then handing off to a
+backbone that is *only* 2D from there on, gets the same practical effect: "the
+decoder only ever touches x,y" is true by construction, since there's no z axis
+left for it to touch.)
 
-| folder | backbone class | VoxelNet class | SlotFormer | x,y downsampled by backbone? |
-|---|---|---|---|---|
-| `exp1_single_stage_bev` | `SingleStageBEVBackbone` (wraps `backbone3d.Sparse3DBackbone`, 1 stage, `SPARSE_BACKBONE_*`) | `SparseBEVSingleStageVoxelNet` | external, 2 cycles (6L) | yes (isotropic stride) |
-| `exp2_down_slot_up_bev` | `DownSlotUpBEVBackbone` (wraps `backbone3d_down_slot_up.SparseDownSlotUpBackbone`, 4-stage down + 4-stage full restore, `SPARSE_BEV_*`) | `SparseBEVDownSlotUpVoxelNet` | built into the backbone, at the bottleneck | yes (isotropic stride), but decoder restores back to input resolution |
-| `exp3_conv_middle_bev` | `ConvMiddleBEVBackbone` (sparse mirror of `model.ConvMiddleLayers`, `SPARSE_BEV_CONVMID_CHANNELS`) | `SparseBEVConvMiddleVoxelNet` | none (dense baseline has none either) | **no** -- x,y's SIZE is unchanged (stride=1, "same" padding, exactly like the dense layer it mirrors); only D shrinks |
+`slotformer.py`'s `SFLayer`/`SlotFormerBackbone` gained a `num_axes` parameter
+(default 3, unchanged) for this: the original 3-axis (x,y,z) direction-cycling
+assumes 4-column `[batch,z,y,x]` coords and would index out of bounds on the
+3-column `[batch,y,x]` coords these experiments have post-z-compression;
+`num_axes=2` cycles only (x,y) so every attention layer does useful windowed work
+instead of wasting 1 of every 3 layers on a degenerate constant axis.
 
-Run from inside each experiment's own folder (each inserts `model/`'s path via
-`sys.path` so `import config`/`from model import ...`/etc. resolve to the shared
-parent modules):
+Because exp1/exp3 never downsample x,y at all, their head runs at the *full* input
+x,y resolution (`head_grid_size` = `SPARSE_BEV_GRID_SIZE`'s own W,H) -- exp2's head
+runs at a coarser resolution (isotropic encoder's stride, times
+`Sparse2DBackbone`'s own /2). This is an inherent consequence of the 3 designs
+answering different questions, not a bug -- don't expect their AP numbers to be
+directly comparable without accounting for it.
+
+Each `voxelnet.py`'s `forward()` returns `(pred_dict, coords, batch_size)` (sparse,
+variable-length) instead of a dense 6-tuple -- targets/loss/decode come from
+`sparse_head_bev.py` (`build_sparse_bev_targets`/`sparse_bev_center_loss`/
+`decode_sparse_bev_boxes`, the 2D-after-height-compression analog of
+`sparse_center_head.py`'s fully-3D versions: same CenterPoint nearest-active-cell
+assignment idea, but z comes back as a regressed value instead of a spatial index),
+and per-epoch val AP from `eval_sparse_bev.py`, not `sparse_bev_head.py`/
+`eval_bev.py` (those stay in use by `dense_baseline_bev`, which still needs a real
+dense tensor to mirror `model.ConvMiddleLayers` faithfully).
+
+Run from inside each experiment's own folder:
 
 ```bash
 cd model/experiments/exp1_single_stage_bev   # or exp2_down_slot_up_bev / exp3_conv_middle_bev
@@ -92,79 +119,56 @@ python smoke_test.py                          # structural check, synthetic data
 python train.py --ckpt_dir checkpoints_exp1_single_stage_bev --batch_size <N> --epochs 20
 ```
 
-### Run exp2_down_slot_up_bev now (status: not yet run as of this push)
+**Real-data measurements (batch_size=4, RTX 2070 8GB)**, comparing this redesign
+against the previous (dense-2D-head) one at the same experiment:
 
-exp3 is running a 20-epoch real-data training pass elsewhere as of this push (and
-will auto-chain into exp1 afterward, same machine) -- **exp2 is free to pick up in
-parallel on another machine/agent right now**, no coordination needed (separate
-checkpoint dirs, doesn't touch exp3/exp1's files). Exact commands:
+| experiment | previous (dense 2D head) | this redesign (fully sparse) |
+|---|---|---|
+| exp3_conv_middle_bev | ~6.2-6.3 it/s, 3.4GB | **~11-12 it/s, ~580MB-3.3GB** |
+| exp1_single_stage_bev | ~3.2-3.5 it/s, ~7-8GB | ~834MB (single-batch check; not yet measured over a sustained run) |
+| exp2_down_slot_up_bev | ~2.5 it/s, ~7GB | ~582MB (single-batch check; not yet measured over a sustained run) |
 
-```bash
-git clone -b sparse https://github.com/pegguiitar/voxelnet_baseline.git voxelnet_baseline   # or git checkout sparse && git pull
-cd voxelnet_baseline/model
-python -m venv .venv && .venv\Scripts\activate           # Windows; source .venv/bin/activate elsewhere
-pip install torch --index-url https://download.pytorch.org/whl/cu126   # match your driver's CUDA
-pip install spconv-cu126   # match your CUDA version instead if not cu126
-
-cd experiments/exp2_down_slot_up_bev
-python smoke_test.py   # ~1 min, synthetic data, confirms the environment/spconv install works first
-
-python train.py --ckpt_dir checkpoints_exp2_down_slot_up_bev --num_workers 4 --epochs 20
-```
-
-Needs `labeling-tool-main` cloned as a **sibling** directory to `voxelnet_baseline`
-(`sonar_diver_dataset.py` reads from `../labeling-tool-main/dataset` directly, no
-separate download/cache step). `train.py` writes `checkpoints_exp2_down_slot_up_bev/
-loss_history.csv` (per-step train loss, and per-epoch val loss + AP3D/precision/
-recall at IoU 0.25/0.3/0.35/0.4/0.5 -- see "Per-epoch validation metrics" below) and
-`epoch_{N}.pth`/`last.pth` checkpoints there; `--resume checkpoints_exp2_down_slot_up_bev/last.pth`
-continues an interrupted run. Expect roughly 2.5 it/s / ~35min/epoch on an 8GB card
-(measured on an RTX 2070) -- not yet run for a full 20 epochs anywhere, so post
-real numbers back once it finishes.
-
-### Per-epoch validation metrics (`eval_bev.py`)
-
-All 4 `train.py`s (exp1/exp2/exp3/dense_baseline) log the exact same per-epoch val
-metric set the confirmed dense-pipeline baseline uses (`model/train.py`'s
-`VAL_LOG_IOUS`/`compute_ap`): AP3D, precision, and recall at IoU
-0.25/0.30/0.35/0.40/0.50 (0.35 is the baseline's own primary/reported threshold),
-via Monte-Carlo OBB IoU (`eval_voxelnet.iou_3d_obb`) on a capped, fixed-seed sample
-of the val split (`--val_ap_max_frames`, default 500 -- scoring the full ~8000-frame
-val split every epoch would dominate total training time). Stdout prints the
-AP@{0.30,0.35,0.40} subset each epoch; the full 15 columns (`ap_iou25`,
-`precision_iou25`, `recall_iou25`, ... `ap_iou50`, `precision_iou50`,
-`recall_iou50`) land in `loss_history.csv`'s `phase="val"` rows. Disable with
-`--val_ap_every_n_epochs 0` if you just want loss curves.
+exp3's ~2x additional speedup (on top of the earlier sparse_ops.py->spconv
+migration's own ~4.4x) and the memory drop from GB to sub-GB is exactly the
+"dense 2D backbone was still the bottleneck" hypothesis confirmed -- removing it
+entirely, not just making its input sparse, is what did this.
 
 ### Backend: spconv, not this repo's own sparse_ops.py
 
-All 3 backbones above are now built on **spconv** (traveller59/spconv2, package
-`spconv-cu126`) instead of this repo's own from-scratch sparse conv primitives
-(`sparse_ops.py`'s `SparseConv3dDown`/`SubMConv3d`/`SparseInverseConv3d`).
-`sparse_ops.py` was originally written to avoid a compiled-CUDA-extension
-dependency (a common source of broken Colab setups -- see that file's own
-docstring) -- but `experiments/profile_pipeline.py` (per-submodule forward/backward
-timing via hooks) found its hand-rolled backward pass ate **~80% of total step
-time** in exp3, ~23x its own forward cost (a normal dense conv's backward is
-roughly 2x its forward), and that cost didn't shrink even when the surrounding
-backbone had almost no other compute (exp3 is just 3 conv layers). Switching to
-spconv's real CUDA kernels fixed this directly, since it happened to already be
-installed and working in this venv:
+Every sparse backbone in this repo (the fully-3D experiment above, and all 3
+BEV experiments) is built on **spconv** (traveller59/spconv2, package
+`spconv-cu126`) instead of a from-scratch sparse conv implementation.
+`sparse_ops.py` originally held one (`SparseConv3dDown`/`SubMConv3d`/
+`SparseInverseConv3d`), written to avoid a compiled-CUDA-extension dependency (a
+common source of broken Colab setups) -- but profiling
+(`experiments/profile_pipeline.py`, per-submodule forward/backward timing via
+hooks) found its hand-rolled backward pass ate ~80% of total step time in an
+earlier exp3 design, ~23x its own forward cost. Switching to spconv's real CUDA
+kernels fixed this directly (measured ~4.4x real-training speedup on its own,
+before the fully-sparse redesign above added another ~2x on top), since it
+happened to already be installed and working in this venv. The from-scratch
+primitives were removed once nothing used them anymore; `sparse_ops.py` now only
+holds `build_index_grid` (still used by `sparse_center_head.py`),
+`scatter_to_bev` (still used by `dense_baseline_bev`), and `yx_key`/
+`restrict_xy_support` (new, see `zdown_to_sparse2d.py`'s docstring above).
 
-| experiment | before (sparse_ops.py) | after (spconv) | speedup |
-|---|---|---|---|
-| exp3_conv_middle_bev | ~1.4 it/s, 4.3GB | ~6.2-6.3 it/s, 3.4GB | ~4.4x |
-| exp1_single_stage_bev | (not measured pre-spconv) | ~3.2-3.5 it/s, ~7-8GB | -- |
-| exp2_down_slot_up_bev | (not measured pre-spconv) | ~2.5 it/s, ~7GB | -- |
-| dense_baseline_bev (real `nn.Conv3d`, for comparison) | -- | ~0.74 it/s, 7.9GB | exp3 now ~8.4x faster than dense |
+### Per-epoch validation metrics (`eval_bev.py` / `eval_sparse_bev.py`)
 
-(batch_size=4, RTX 2070 8GB, real sonar data -- all measured over 250+ real
-training steps per this repo's "measure before committing" methodology, not
-synthetic-data smoke tests.) `sparse_ops.py`'s `build_index_grid` and
-`scatter_to_bev` are still used (the scatter step was never the bottleneck --
-its backward is a plain gather over unique indices, not the duplicate-index
-scatter-add pattern that was actually slow) but the from-scratch conv primitives
-are dead code now that backbone3d.py/backbone3d_down_slot_up.py both use spconv.
+Every `train.py` in `experiments/` logs the exact same per-epoch val metric set
+the confirmed dense-pipeline baseline uses (`model/train.py`'s `VAL_LOG_IOUS`/
+`compute_ap`): AP3D, precision, and recall at IoU 0.25/0.30/0.35/0.40/0.50 (0.35 is
+the baseline's own primary/reported threshold), via Monte-Carlo OBB IoU
+(`eval_voxelnet.iou_3d_obb`) on a capped, fixed-seed sample of the val split
+(`--val_ap_max_frames`, default 500 -- scoring the full ~8000-frame val split every
+epoch would dominate total training time). Stdout prints the AP@{0.30,0.35,0.40}
+subset each epoch; the full 15 columns (`ap_iou25`, `precision_iou25`,
+`recall_iou25`, ... `ap_iou50`, `precision_iou50`, `recall_iou50`) land in
+`loss_history.csv`'s `phase="val"` rows. Disable with `--val_ap_every_n_epochs 0`
+if you just want loss curves. `dense_baseline_bev`/exp1/2/3 (dense-BEV-head design,
+now superseded) use `eval_bev.py`; the current exp1/2/3 (fully sparse) use
+`eval_sparse_bev.py` -- same metric definitions, different decode function
+underneath (`sparse_bev_head.decode_bev_center_boxes` vs.
+`sparse_head_bev.decode_sparse_bev_boxes`).
 
 ## Setup
 

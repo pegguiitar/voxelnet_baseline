@@ -37,6 +37,36 @@ def build_index_grid(coords: torch.Tensor, batch_size: int, grid_size, device=No
     return grid
 
 
+def yx_key(coords: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """Encode a sparse tensor's (batch,y,x) columns (indices [0,2,3] in this repo's
+    [batch,z,y,x] convention) into one integer per row, for fast set-membership
+    tests via torch.isin -- used by restrict_xy_support."""
+    b, y, x = coords[:, 0].long(), coords[:, 2].long(), coords[:, 3].long()
+    return (b * H + y) * W + x
+
+
+def restrict_xy_support(x, allowed_keys: torch.Tensor, H: int, W: int):
+    """Drop every row of sparse tensor `x` (any spconv.SparseConvTensor) whose
+    (batch,y,x) isn't in allowed_keys.
+
+    Needed because spconv's SparseConv3d (unlike SubMConv3d) doesn't restrict a
+    stride==1 axis to its input support the way a true submanifold conv would: for
+    a z-only-stride conv (stride=(2,1,1), x,y meant to stay untouched), spconv still
+    discovers every neighbor-reachable (y,x) the k^3 kernel touches, "dilating" the
+    active set outward in x,y every stage even though nothing is being downsampled
+    there. Measured impact building experiments/exp1-3's fully-sparse redesign
+    (2026-09-03): a single z-only-stride stage grew 800 synthetic voxels to 10000+
+    before this filter; with it, the count stays bounded (grows modestly from
+    z-kernel overlap, then shrinks back down as D keeps shrinking) and reaches
+    exactly the original unique-(y,x) count once D==1. Call with `allowed_keys`
+    computed ONCE from the voxel grid's original (pre-any-z-down-stage) active set
+    (x,y are never supposed to change across these stages at all), after every
+    z-only-stride stage."""
+    keys = yx_key(x.indices, H, W)
+    mask = torch.isin(keys, allowed_keys)
+    return x.__class__(x.features[mask], x.indices[mask], x.spatial_shape, x.batch_size)
+
+
 def scatter_to_bev(features: torch.Tensor, coords: torch.Tensor, grid_size, batch_size: int,
                     channels: int) -> torch.Tensor:
     """Scatter a sparse (N,C) tensor to dense (B,C,D,H,W) via coords, then merge z

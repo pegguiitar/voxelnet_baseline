@@ -185,6 +185,49 @@ SPARSE_BEV_SLOTFORMER_NUM_HEADS = 4
 # BEV로 누르는 부분만 sparse로 바꾼 것"을 보고 싶다는 요청으로 이 설계로 교체됨.)
 SPARSE_BEV_CONVMID_CHANNELS = 64  # ConvMiddleLayers의 고정 채널 폭과 동일
 
+# experiments/exp4_fully_sparse_bev/voxelnet.py 전용 (2026-09-03) -- exp1/2/3는 전부
+# "sparse encoder -> dense (B,C,H,W)로 scatter -> dense 2D RPNBackbone" 구조라, 2D 부분은
+# VoxelNeXt가 정확히 피하려던 "빈 셀도 전부 계산하는" 비용을 그대로 가진다. 이 실험은 dense
+# 텐서를 아예 한 번도 만들지 않는다: z만 stride로 계속 줄여서 D=1까지 완전히 압축한 뒤
+# (그러면 같은 (batch,y,x)에 voxel이 최대 1개만 남아서 z 컬럼만 버리면 바로 sparse 2D 좌표가
+# 됨 -- merge 연산 필요 없음), 그 결과를 spconv의 2D sparse conv(backbone2d_sparse.py)로 계속
+# 처리해서 head까지 sparse인 채로 예측한다 (sparse_head_bev.py).
+# STAGE_CHANNELS 5단계, 매 단계 stride=(2,1,1) padding=1 -- D: 22->11->6->3->2->1 (정확히
+# 5단계만에 1로 떨어짐, SPARSE_BEV_GRID_SIZE의 D'=22 기준 계산됨).
+SPARSE_FULLY_ZDOWN_STAGE_CHANNELS = (64, 80, 96, 112, 128)
+SPARSE_FULLY_ZDOWN_DOWNSAMPLE_KERNEL = 3
+
+# 2D sparse backbone -- dense RPNBackbone(model.py)과 똑같은 채널/레이어 수를 그대로 재사용
+# (block1/2/3 다운샘플 + deconv-concat neck) -- "2D 부분을 sparse로 바꾸면 어떻게 되는가"만
+# 보려는 것이라 구조 자체는 dense RPNBackbone과 동일하게 맞춤.
+SPARSE_FULLY_BLOCK_CHANNELS = (128, 128, 256)   # = config.RPN_BLOCK_CHANNELS
+SPARSE_FULLY_BLOCK_LAYERS = (4, 6, 6)           # = config.RPN_BLOCK_LAYERS
+SPARSE_FULLY_UPSAMPLE_CHANNELS = 256            # = config.RPN_UPSAMPLE_CHANNELS
+
+# experiments/exp1_single_stage_bev/voxelnet.py 전용 (2026-09-03, 재설계) -- exp3와 똑같이
+# z만 D=1까지 압축(x,y는 끝까지 그대로)한 뒤, 그 sparse 2D feature 위에서 SlotFormer로
+# windowed attention만 추가한다(별도 spatial backbone 없음) -- exp3(아무것도 안 얹음)과
+# exp2(진짜 2D U-Net) 사이의 "attention만 추가하면 얼마나 도움되나" 비교점.
+# WIN_SIZE=48: x,y가 한 번도 안 줄어서 유효 해상도가 원래 VOXEL_SIZE(0.1)m/voxel 그대로 --
+# 물리적 윈도우 ~4.8m 기준 48 = 4.8/0.1 (예전 z-only-stride 실험과 동일한 이유/값).
+SPARSE_FULLY_SLOTFORMER_WIN_SIZE = 48
+SPARSE_FULLY_SLOTFORMER_NUM_CYCLES = 2  # 4L (2축 x,y만 순환이라 3축때의 6L과 레이어 수 다름)
+SPARSE_FULLY_SLOTFORMER_NUM_HEADS = 4
+
+# experiments/exp2_down_slot_up_bev/voxelnet.py 전용 (2026-09-03, 재설계) -- U-Net처럼
+# encoder에서 x,y,z를 다같이(isotropic) stride로 줄인 뒤, bottleneck에서 z만 마저 1까지
+# 압축하고, 그 다음은 진짜 2D인 Sparse2DBackbone(SPARSE_FULLY_BLOCK_*, 자체적으로 2D
+# down+up U-Net 구조를 이미 가짐)으로 x,y를 다시 올린다 -- spconv의 SparseInverseConv3d가
+# "일부 축만" 되돌리는 걸 지원 안 해서(자기가 페어링된 conv를 정확히 그대로만 되돌림),
+# "encoder는 3D isotropic, decoder는 x,y만"을 문자대로 구현할 수 없어 이렇게 우회함
+# (bottleneck에서 2D로 넘어간 뒤 진짜 2D decoder를 쓰는 것과 사실상 동일 효과).
+# 1단계만 사용(가볍게) -- 그 뒤 Sparse2DBackbone 자체가 이미 3단계 다운샘플을 더 하므로,
+# 여기서 너무 깊게 줄이면 최종 해상도가 지나치게 작아짐.
+SPARSE_FULLY_ENCODER_STAGE_CHANNELS = (128,)
+SPARSE_FULLY_ENCODER_NUM_BLOCKS_PER_STAGE = 3
+SPARSE_FULLY_ENCODER_DOWNSAMPLE_KERNEL = 3
+SPARSE_FULLY_ENCODER_DOWNSAMPLE_STRIDE = 2
+
 # --- 학습 ---
 BATCH_SIZE = 4
 NUM_EPOCHS = 30

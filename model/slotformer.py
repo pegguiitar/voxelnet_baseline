@@ -42,7 +42,8 @@ class SFLayer(nn.Module):
     ones, since it's cheap and keeps every layer's code path identical.
     """
 
-    def __init__(self, channels, num_heads, win_size, direction, shift, temperature=10000, ffn_ratio=4):
+    def __init__(self, channels, num_heads, win_size, direction, shift, temperature=10000, ffn_ratio=4,
+                 num_axes=3):
         super().__init__()
         assert channels % num_heads == 0
         self.channels = channels
@@ -52,6 +53,10 @@ class SFLayer(nn.Module):
         self.direction = direction
         self.shift = shift
         self.temperature = temperature
+        self.num_axes = num_axes  # 3 = default (z,y,x coords); 2 = 2D coords (y,x only, e.g.
+        # after z has been compressed away to D=1 -- see zdown_to_sparse2d.py) -- only affects
+        # how many coords columns the positional encoding sums over, since coords itself simply
+        # has fewer columns in that case ([batch,y,x] instead of [batch,z,y,x]).
 
         self.norm1 = nn.LayerNorm(channels)
         self.qkv = nn.Linear(channels, channels * 3)
@@ -65,7 +70,7 @@ class SFLayer(nn.Module):
 
     def _positional_encoding(self, coords):
         pe = torch.zeros(coords.shape[0], self.channels, device=coords.device, dtype=torch.float32)
-        for axis in (1, 2, 3):
+        for axis in range(1, self.num_axes + 1):
             pe = pe + sinusoidal_pe(coords[:, axis].float(), self.channels, self.temperature)
         return pe
 
@@ -182,12 +187,15 @@ class SFLayer(nn.Module):
 
 
 class SlotFormerBackbone(nn.Module):
-    def __init__(self, channels, win_size, num_cycles=2, num_heads=4, temperature=10000):
+    def __init__(self, channels, win_size, num_cycles=2, num_heads=4, temperature=10000, num_axes=3):
         super().__init__()
-        directions = [0, 1, 2] * num_cycles
+        directions = list(range(num_axes)) * num_cycles  # 3 axes (x,y,z) by default; num_axes=2
+        # for a 2D-coords backbone (e.g. after z has been compressed away -- zdown_to_sparse2d.py)
+        # cycles only (x,y), so every layer does useful windowed work (no wasted/degenerate axis).
         layers = []
         for i, d in enumerate(directions):
-            layers.append(SFLayer(channels, num_heads, win_size, d, shift=(i % 2 == 1), temperature=temperature))
+            layers.append(SFLayer(channels, num_heads, win_size, d, shift=(i % 2 == 1),
+                                   temperature=temperature, num_axes=num_axes))
         self.layers = nn.ModuleList(layers)
 
     def forward(self, features, coords):
