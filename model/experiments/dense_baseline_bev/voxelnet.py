@@ -1,15 +1,24 @@
 """dense_baseline_bev - the literal DENSE counterpart to exp3_conv_middle_bev, for a
 direct dense-vs-sparse comparison. VFE -> dense scatter -> model.ConvMiddleLayers
 (UNCHANGED, the real nn.Conv3d dense implementation, not a sparse mirror) -> reshape
-z into channels -> RPNCenterHead. Same SPARSE_BEV_* voxelization, same
-SonarDiverDataset/collate_fn, same sparse_bev_head.build_bev_targets +
-center_loss.center_voxelnet_loss, same RPNCenterHead as exp1/exp2/exp3 -- this
+z into channels -> dense_head_bev.DenseBEVCenterHeadDirect (NO RPNBackbone). Same
+SPARSE_BEV_* voxelization, same SonarDiverDataset/collate_fn, same
+sparse_bev_head.build_bev_targets + center_loss.center_voxelnet_loss as exp3 -- this
 differs from exp3_conv_middle_bev in EXACTLY one thing: ConvMiddleLayers computed
-with real nn.Conv3d over the full dense grid instead of SparseConv3dDown over only
-the active voxels. Everything else (VFE, head, data, loss, targets, output shape --
-same kernel/stride/padding arithmetic means D_out/H_out/W_out come out identical to
-exp3's) is byte-for-byte the same, so any speed/memory difference measured between
-this and exp3 is attributable to sparse vs. dense compute alone.
+with real nn.Conv3d over the full dense grid instead of SparseConv3d over only the
+active voxels. Everything else (VFE, head, data, loss, targets, output
+resolution) is byte-for-byte the same, so any speed/memory difference measured
+between this and exp3 is attributable to sparse vs. dense compute alone.
+
+2026-09-03: exp3's fully-sparse redesign (README's "Fully-sparse BEV experiments")
+dropped RPNBackbone entirely (predicts straight off the z-compressed sparse
+features, at the FULL input x,y resolution, no 2D backbone at all) and swapped
+RPNCenterHead for sparse_head_bev.SparseBEVCenterHead. This file is updated to
+match: model.RPNCenterHead can't be reused (it always runs RPNBackbone internally,
+not optional), so dense_head_bev.DenseBEVCenterHeadDirect (the same head set as
+plain nn.Conv2d, no backbone) replaces it here, and the old bev_project 1x1-conv
+adapter (needed only to feed RPNBackbone's fixed RPN_IN_CHANNELS input) is gone --
+DenseBEVCenterHeadDirect just takes ConvMiddleLayers' own output width directly.
 
 Why not the original model/train.py (the repo's actual dense pipeline entry point)?
 That script needs either a pre-built voxel cache (data_final/cache_strong/voxel) or
@@ -28,15 +37,18 @@ import torch
 import torch.nn as nn
 
 import config
-from model import StackedVFE, RPNCenterHead, ConvMiddleLayers
+from model import StackedVFE, ConvMiddleLayers
+from dense_head_bev import DenseBEVCenterHeadDirect
 
 
 class DenseBEVBackbone(nn.Module):
     """model.ConvMiddleLayers, UNCHANGED -- scatters the VFE's per-voxel output to a
     dense (B,128,D,H,W) grid first (a real dense conv needs a real dense tensor,
     unlike the sparse experiments which only ever materialize a dense tensor once,
-    at the very end), then runs the same 3 nn.Conv3d layers exp3_conv_middle_bev's
-    ConvMiddleBEVBackbone mirrors, then reshapes z into channels."""
+    at the very end), then runs the same 3 nn.Conv3d layers
+    exp3_conv_middle_bev/voxelnet.py's ZDownTo2D-based z-compression mirrors, then
+    reshapes z into channels. Never touches H,W (all 3 layers use stride=1/"same"
+    padding there), matching exp3's own "x,y untouched" property exactly."""
 
     def __init__(self, in_channels=128):
         super().__init__()
@@ -46,9 +58,10 @@ class DenseBEVBackbone(nn.Module):
 
     @staticmethod
     def output_grid_size(grid_size):
-        """Same arithmetic as ConvMiddleBEVBackbone.output_grid_size (identical
-        kernel/stride/padding triples) -- D_out/H_out/W_out come out identical to
-        exp3_conv_middle_bev's, by construction."""
+        """Same arithmetic as exp3_conv_middle_bev's z-down stages (identical
+        kernel/stride/padding triples, just 3 fixed layers here instead of 5) --
+        D_out comes out identical to whatever ConvMiddleLayers' own D'->D'' is;
+        H,W are unchanged (this class's docstring)."""
         D, H, W = grid_size
         D = (D + 2 * 1 - 3) // 2 + 1  # conv1: stride=2, padding=1
         D = (D + 2 * 0 - 3) // 1 + 1  # conv2: stride=1, padding=0
@@ -80,23 +93,16 @@ class DenseBEVVoxelNet(nn.Module):
 
         self.out_grid_size = self.backbone.output_grid_size(self.input_grid_size)  # (D_out,H_out,W_out)
         D_out, H_out, W_out = self.out_grid_size
+        assert (H_out, W_out) == (Hp, Wp)  # ConvMiddleLayers never touches H,W -- sanity check
 
         bev_channels = self.backbone.out_channels * D_out
-        self._project = bev_channels != config.RPN_IN_CHANNELS
-        if self._project:
-            self.bev_project = nn.Conv2d(bev_channels, config.RPN_IN_CHANNELS, kernel_size=1)
-            self.bev_bn = nn.BatchNorm2d(config.RPN_IN_CHANNELS)
-            self.bev_relu = nn.ReLU(inplace=True)
+        self.head = DenseBEVCenterHeadDirect(bev_channels)  # no RPNBackbone -- matches exp3's sparse head exactly
 
-        self.head = RPNCenterHead()  # unchanged dense pipeline head (model.py)
-
-        # RPNBackbone's block1 (RPNBlock's first conv: kernel=3,stride=2,padding=1) sets the
-        # final output size -- out=(in+2*1-3)//2+1=(in-1)//2+1 (== ceil(in/2), NOT in//2 --
-        # those two only agree for EVEN in).
+        # x,y are untouched by ConvMiddleLayers -- head runs at the FULL input x,y
+        # resolution, same as exp3_conv_middle_bev's sparse head.
         sx, sy, _ = config.SPARSE_BEV_VOXEL_SIZE
-        self.head_grid_size = ((W_out - 1) // 2 + 1, (H_out - 1) // 2 + 1)  # (W'', H'')
-        self.head_stride = (sx * (W_out / self.head_grid_size[0]),
-                             sy * (H_out / self.head_grid_size[1]))  # meters/cell at head resolution
+        self.head_grid_size = (Wp, Hp)
+        self.head_stride = (sx, sy)
         self.pc_range = config.SPARSE_BEV_POINT_CLOUD_RANGE
 
     def forward(self, voxel_features: torch.Tensor, num_points: torch.Tensor, coords: torch.Tensor):
@@ -104,7 +110,4 @@ class DenseBEVVoxelNet(nn.Module):
         batch_size = int(coords[:, 0].max().item()) + 1 if len(coords) else 1
 
         feat2d = self.backbone(voxelwise, coords, self.input_grid_size, batch_size)
-        if self._project:
-            feat2d = self.bev_relu(self.bev_bn(self.bev_project(feat2d)))
-
         return self.head(feat2d)
