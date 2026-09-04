@@ -1,0 +1,20 @@
+{
+  "split": {
+    "train": [
+      "Person2/scene_0050", "Person2/scene_0091", "Person2/scene_0079", "Person2/scene_0078",
+      "Person1/scene_0068", "Person1/scene_0063", "Person3/scene_0022", "Person3/scene_0080",
+      "Person4/scene_0074", "Person1/scene_0036", "Person1/scene_0042", "Person3/scene_0048",
+      "Person3/scene_0072", "Person4/scene_0021", "Person3/scene_0082", "Person1/scene_0000",
+      "Person1/scene_0044", "Person3/scene_0070", "Person2/scene_0076", "Person4/scene_0065",
+      "Person4/scene_0081"
+    ],
+    "val": [
+      "Person2/scene_0009", "Person3/scene_0019", "Person1/scene_0049", "Person3/scene_0064",
+      "Person4/scene_0075", "Person4/scene_0090", "Person3/scene_0092"
+    ],
+    "test": [
+      "Person2/scene_0035", "Person3/scene_0043", "Person4/scene_0055", "Person3/scene_0067",
+      "Person4/scene_0077", "Person4/scene_0088", "Person2/scene_0089", "Person4/scene_0093"
+    ]
+  }
+}
