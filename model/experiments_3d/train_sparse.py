@@ -16,8 +16,11 @@ Usage:
 """
 import argparse
 import csv
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # -> voxelnet_baseline/model
 
 import torch
 from torch.utils.data import DataLoader

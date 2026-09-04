@@ -6,6 +6,11 @@ pipeline's shapes/wiring are correct, not that it detects anything real.
 
 Usage: python smoke_sparse_voxelnet.py
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # -> voxelnet_baseline/model
+
 import numpy as np
 import torch
 
